@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# Cache bust: 2026-02-01-1344
+ARG CACHEBUST=1
+
 # Install system dependencies for OpenCV and MediaPipe
 RUN apt-get update && apt-get install -y \
     libgl1 \
