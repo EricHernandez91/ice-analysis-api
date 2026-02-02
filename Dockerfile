@@ -22,6 +22,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Disable GPU for MediaPipe in headless environments
+ENV MEDIAPIPE_DISABLE_GPU=1
+
 # Expose port
 EXPOSE 8000
 

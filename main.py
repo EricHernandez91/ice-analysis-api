@@ -4,6 +4,9 @@ Uses MediaPipe Pose for skeleton detection and custom algorithms for element det
 """
 
 import os
+# Disable GPU for MediaPipe (required for headless server environments)
+os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
+
 import tempfile
 import math
 from typing import List, Optional
