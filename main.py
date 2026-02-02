@@ -32,15 +32,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize MediaPipe Pose
+# Lazy initialization for MediaPipe Pose (avoids GPU issues at startup)
 mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(
-    static_image_mode=False,
-    model_complexity=1,
-    enable_segmentation=False,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+_pose_instance = None
+
+def get_pose():
+    """Get or create MediaPipe Pose instance (lazy init for serverless)."""
+    global _pose_instance
+    if _pose_instance is None:
+        _pose_instance = mp_pose.Pose(
+            static_image_mode=True,  # True = CPU-friendly, no video tracking state
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+    return _pose_instance
 
 # Response models
 class Keypoint(BaseModel):
@@ -334,8 +341,8 @@ def extract_poses_from_video(video_path: str, sample_rate: int = 3) -> tuple:
             # Convert BGR to RGB
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Process with MediaPipe
-            results = pose.process(rgb_frame)
+            # Process with MediaPipe (lazy init)
+            results = get_pose().process(rgb_frame)
             
             if results.pose_landmarks:
                 keypoints = []
