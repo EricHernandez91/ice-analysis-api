@@ -45,13 +45,12 @@ def get_session():
     global _session
     if _session is None:
         print(f"[MODEL] Loading ONNX model from {MODEL_PATH}...")
-        # Limit threads to reduce memory pressure on free tier
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 1
-        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 4
+        opts.inter_op_num_threads = 2
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         _session = ort.InferenceSession(MODEL_PATH, sess_options=opts, providers=['CPUExecutionProvider'])
-        print(f"[MODEL] Model loaded successfully (single-thread mode)")
+        print(f"[MODEL] Model loaded successfully (multi-thread mode)")
     return _session
 
 # COCO keypoint indices (17 keypoints from YOLOv8-Pose)
@@ -240,9 +239,9 @@ def extract_frame_data(video_path: str):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if fps > 0 else 0
     
-    # Adaptive subsampling: target ~12-15 frames max for analysis
-    # This keeps memory and CPU manageable on free tier (512MB)
-    target_frames = 15
+    # Process every frame on paid tier for maximum accuracy
+    # (Subsample only for very long videos to keep response time reasonable)
+    target_frames = 60
     step = max(1, total_frames // target_frames)
     
     print(f"[ANALYZE] {total_frames} frames @ {fps:.1f}fps, step={step}, ~{total_frames//step} will be processed")
