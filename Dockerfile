@@ -22,6 +22,9 @@ COPY yolov8n-pose.onnx .
 # Copy application code
 COPY . .
 
+# Run startup test during build to catch import errors early
+RUN python test_startup.py
+
 # Expose port
 EXPOSE 8000
 
