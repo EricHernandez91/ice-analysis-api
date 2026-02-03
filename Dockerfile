@@ -1,9 +1,6 @@
 FROM python:3.11-slim
 
-# Cache bust: 2026-02-01-1344
-ARG CACHEBUST=1
-
-# Install system dependencies for OpenCV and MediaPipe
+# Install system dependencies for OpenCV
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
@@ -19,11 +16,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy ONNX model (pre-exported, 13MB - no PyTorch needed!)
+COPY yolov8n-pose.onnx .
+
 # Copy application code
 COPY . .
-
-# Disable GPU for MediaPipe in headless environments
-ENV MEDIAPIPE_DISABLE_GPU=1
 
 # Expose port
 EXPOSE 8000

@@ -1,12 +1,9 @@
 """
-IceAnalysis API - Figure Skating Video Analysis Backend
-Uses MediaPipe Pose for skeleton detection and custom algorithms for element detection.
+IceAnalysis API v2 — ONNX Runtime + YOLOv8-Pose Figure Skating Analysis
+Lightweight: 13MB ONNX model, no PyTorch dependency.
 """
 
 import os
-# Disable GPU for MediaPipe (required for headless server environments)
-os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
-
 import tempfile
 import math
 from typing import List, Optional
@@ -15,15 +12,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import cv2
 import numpy as np
-import mediapipe as mp
+import onnxruntime as ort
 
 app = FastAPI(
     title="IceAnalysis API",
-    description="AI-powered figure skating video analysis",
-    version="1.0.0"
+    description="AI-powered figure skating video analysis using YOLOv8-Pose (ONNX)",
+    version="2.0.0"
 )
 
-# CORS for mobile app
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,38 +28,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Lazy initialization for MediaPipe Pose (avoids GPU issues at startup)
-mp_pose = mp.solutions.pose
-_pose_instance = None
+# ── YOLO-Pose ONNX Model ────────────────────────────────────────────
 
-def get_pose():
-    """Get or create MediaPipe Pose instance (lazy init for serverless)."""
-    global _pose_instance
-    if _pose_instance is None:
-        _pose_instance = mp_pose.Pose(
-            static_image_mode=True,  # True = CPU-friendly, no video tracking state
-            model_complexity=1,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-    return _pose_instance
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "yolov8n-pose.onnx")
+_session = None
 
-# Response models
-class Keypoint(BaseModel):
-    x: float
-    y: float
-    z: float
-    visibility: float
-    name: str
+def get_session():
+    global _session
+    if _session is None:
+        _session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
+    return _session
 
-class FramePose(BaseModel):
-    frame: int
-    timestamp_ms: float
-    keypoints: List[Keypoint]
-    
+# COCO keypoint indices (17 keypoints from YOLOv8-Pose)
+KP = {
+    'nose': 0, 'left_eye': 1, 'right_eye': 2, 'left_ear': 3, 'right_ear': 4,
+    'left_shoulder': 5, 'right_shoulder': 6, 'left_elbow': 7, 'right_elbow': 8,
+    'left_wrist': 9, 'right_wrist': 10, 'left_hip': 11, 'right_hip': 12,
+    'left_knee': 13, 'right_knee': 14, 'left_ankle': 15, 'right_ankle': 16,
+}
+
+
+# ── Response Models ──────────────────────────────────────────────────
+
 class SkatingElement(BaseModel):
-    type: str  # 'jump' or 'spin'
+    type: str
     name: str
     start_frame: int
     end_frame: int
@@ -80,253 +68,146 @@ class AnalysisResult(BaseModel):
     duration_seconds: float
     elements: List[SkatingElement]
     session_feedback: List[str]
-    poses: Optional[List[FramePose]] = None
+    poses: Optional[dict] = None
 
-# Keypoint names from MediaPipe
-KEYPOINT_NAMES = [
-    'nose', 'left_eye_inner', 'left_eye', 'left_eye_outer',
-    'right_eye_inner', 'right_eye', 'right_eye_outer',
-    'left_ear', 'right_ear', 'mouth_left', 'mouth_right',
-    'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
-    'left_wrist', 'right_wrist', 'left_pinky', 'right_pinky',
-    'left_index', 'right_index', 'left_thumb', 'right_thumb',
-    'left_hip', 'right_hip', 'left_knee', 'right_knee',
-    'left_ankle', 'right_ankle', 'left_heel', 'right_heel',
-    'left_foot_index', 'right_foot_index'
-]
 
-class SkatingAnalyzer:
-    """Analyzes pose sequences to detect skating elements."""
-    
-    def __init__(self):
-        self.frame_history = []
-        
-    def reset(self):
-        self.frame_history = []
-    
-    def analyze_frame(self, keypoints: List[Keypoint], frame: int, fps: float):
-        """Analyze a single frame's pose data."""
-        if len(keypoints) < 33:
-            return None
-            
-        # Get key landmarks
-        left_hip = keypoints[23]
-        right_hip = keypoints[24]
-        left_ankle = keypoints[27]
-        right_ankle = keypoints[28]
-        left_shoulder = keypoints[11]
-        right_shoulder = keypoints[12]
-        
-        # Calculate center of mass (hip midpoint)
-        center_y = (left_hip.y + right_hip.y) / 2
-        center_x = (left_hip.x + right_hip.x) / 2
-        
-        # Calculate body angle
-        shoulder_mid_x = (left_shoulder.x + right_shoulder.x) / 2
-        shoulder_mid_y = (left_shoulder.y + right_shoulder.y) / 2
-        body_angle = math.degrees(math.atan2(
-            shoulder_mid_y - center_y,
-            shoulder_mid_x - center_x
-        ))
-        
-        # Ankle height (lower y = higher in frame = higher jump)
-        ankle_y = min(left_ankle.y, right_ankle.y)
-        
-        analysis = {
-            'frame': frame,
-            'center_x': center_x,
-            'center_y': center_y,
-            'ankle_y': ankle_y,
-            'body_angle': body_angle,
-            'is_airborne': False,
-            'rotation_speed': 0
-        }
-        
-        # Detect if airborne (compare to baseline)
-        if len(self.frame_history) >= 10:
-            baseline_ankle = sum(f['ankle_y'] for f in self.frame_history[-10:]) / 10
-            # If ankle is significantly higher (lower y value) than baseline
-            # Lowered threshold from 0.05 to 0.02 for better detection of smaller jumps
-            if ankle_y < baseline_ankle - 0.02:  # 2% of frame height (more sensitive)
-                analysis['is_airborne'] = True
-            # Also check hip position change for jump detection
-            if len(self.frame_history) >= 5:
-                baseline_hip = sum(f['center_y'] for f in self.frame_history[-5:]) / 5
-                if center_y < baseline_hip - 0.03:  # Hip rises during jump
-                    analysis['is_airborne'] = True
-        
-        # Calculate rotation speed
-        if len(self.frame_history) >= 1:
-            prev = self.frame_history[-1]
-            angle_diff = body_angle - prev['body_angle']
-            # Handle angle wraparound
-            if angle_diff > 180:
-                angle_diff -= 360
-            if angle_diff < -180:
-                angle_diff += 360
-            analysis['rotation_speed'] = angle_diff * fps  # degrees per second
-        
-        self.frame_history.append(analysis)
-        return analysis
-    
-    def detect_elements(self, fps: float) -> List[SkatingElement]:
-        """Detect jumps and spins from analyzed frames."""
-        elements = []
-        
-        if len(self.frame_history) < 30:
-            return elements
-        
-        # Detect jumps (airborne sequences)
-        jump_start = None
-        total_rotation = 0
-        
-        for i, frame in enumerate(self.frame_history):
-            if frame['is_airborne'] and jump_start is None:
-                jump_start = i
-                total_rotation = 0
-            elif frame['is_airborne'] and jump_start is not None:
-                total_rotation += abs(frame['rotation_speed'] / fps)
-            elif not frame['is_airborne'] and jump_start is not None:
-                # Jump ended
-                air_frames = i - jump_start
-                if air_frames >= 2:  # Minimum 2 frames airborne (was 5 - too strict)
-                    jump = self._classify_jump(
-                        self.frame_history[jump_start:i],
-                        total_rotation,
-                        fps
-                    )
-                    if jump:
-                        elements.append(jump)
-                jump_start = None
-                total_rotation = 0
-        
-        # Detect spins (high rotation while grounded)
-        spin_start = None
-        
-        for i, frame in enumerate(self.frame_history):
-            is_spinning = abs(frame['rotation_speed']) > 180 and not frame['is_airborne']
-            
-            if is_spinning and spin_start is None:
-                spin_start = i
-            elif not is_spinning and spin_start is not None:
-                spin_frames = i - spin_start
-                if spin_frames >= 30:  # Minimum 1 second spin
-                    spin = self._classify_spin(
-                        self.frame_history[spin_start:i],
-                        fps
-                    )
-                    if spin:
-                        elements.append(spin)
-                spin_start = None
-        
-        return elements
-    
-    def _classify_jump(self, frames: list, total_rotation: float, fps: float) -> Optional[SkatingElement]:
-        """Classify a detected jump."""
-        rotations = total_rotation / 360
-        # Accept even small jumps (waltz jumps are ~0.5 rotation, bunny hops less)
-        if rotations < 0.3:
-            return None
-        
-        # Determine rotation count
-        rot_count = round(rotations * 2) / 2  # Round to nearest 0.5
-        
-        # Determine jump name
-        if rot_count == 1.5 or rot_count == 2.5 or rot_count == 3.5:
-            # Axel (half rotation extra)
-            prefix = {1.5: 'Single', 2.5: 'Double', 3.5: 'Triple'}.get(rot_count, '')
-            name = f'{prefix} Axel'
-        else:
-            prefix = {1: 'Single', 2: 'Double', 3: 'Triple', 4: 'Quad'}.get(int(rot_count), '')
-            name = f'{prefix} Jump'
-        
-        # Generate feedback
-        feedback = []
-        air_time = len(frames) / fps
-        
-        if air_time > 0.5:
-            feedback.append(f'Good air time ({air_time:.2f}s)')
-        else:
-            feedback.append(f'Work on jump height (air time: {air_time:.2f}s)')
-        
-        # Check body position
-        avg_angle = sum(f['body_angle'] for f in frames) / len(frames)
-        if abs(avg_angle) < 15:
-            feedback.append('Good vertical axis in air')
-        else:
-            feedback.append('Try to stay more vertical during rotation')
-        
-        # Calculate score (simplified)
-        base_value = rot_count * 1.5
-        height_bonus = 0.3 if air_time > 0.5 else -0.2
-        score = round(base_value + height_bonus, 1)
-        
-        return SkatingElement(
-            type='jump',
-            name=name,
-            start_frame=frames[0]['frame'],
-            end_frame=frames[-1]['frame'],
-            start_time=frames[0]['frame'] / fps,
-            end_time=frames[-1]['frame'] / fps,
-            confidence=min(0.95, 0.6 + rot_count * 0.1),
-            score=score,
-            feedback=feedback
-        )
-    
-    def _classify_spin(self, frames: list, fps: float) -> Optional[SkatingElement]:
-        """Classify a detected spin."""
-        # Calculate total revolutions
-        total_rotation = sum(abs(f['rotation_speed'] / fps) for f in frames)
-        revolutions = total_rotation / 360
-        
-        if revolutions < 2:
-            return None
-        
-        # Determine spin type from body angle
-        avg_body_angle = sum(f['body_angle'] for f in frames) / len(frames)
-        
-        if abs(avg_body_angle) > 60:
-            name = 'Camel Spin'
-            feedback = ['Good horizontal position']
-        elif abs(avg_body_angle) > 30:
-            name = 'Sit Spin'
-            feedback = ['Good sit position']
-        else:
-            name = 'Upright Spin'
-            feedback = ['Nice vertical alignment']
-        
-        # Check centering (drift)
-        start_x = frames[0]['center_x']
-        end_x = frames[-1]['center_x']
-        drift = abs(end_x - start_x)
-        
-        if drift < 0.1:
-            feedback.append('Excellent centering - minimal travel')
-        else:
-            feedback.append('Work on centering - spin is traveling')
-        
-        feedback.append(f'{int(revolutions)} revolutions')
-        
-        # Calculate score
-        base_value = 2.0
-        rev_bonus = 0.5 if revolutions >= 6 else 0
-        center_bonus = 0.3 if drift < 0.1 else -0.2
-        score = round(base_value + rev_bonus + center_bonus, 1)
-        
-        return SkatingElement(
-            type='spin',
-            name=name,
-            start_frame=frames[0]['frame'],
-            end_frame=frames[-1]['frame'],
-            start_time=frames[0]['frame'] / fps,
-            end_time=frames[-1]['frame'] / fps,
-            confidence=0.85,
-            score=score,
-            feedback=feedback
-        )
+# ── ONNX Inference Helpers ───────────────────────────────────────────
 
-def extract_poses_from_video(video_path: str, sample_rate: int = 3) -> tuple:
-    """Extract poses from video using MediaPipe."""
+def preprocess_frame(frame, input_size=640):
+    """Preprocess frame for YOLOv8: resize, normalize, HWC→CHW, add batch."""
+    h, w = frame.shape[:2]
+    scale = input_size / max(h, w)
+    new_w, new_h = int(w * scale), int(h * scale)
+    resized = cv2.resize(frame, (new_w, new_h))
+    
+    # Pad to square
+    pad_w = input_size - new_w
+    pad_h = input_size - new_h
+    padded = cv2.copyMakeBorder(resized, 0, pad_h, 0, pad_w, 
+                                 cv2.BORDER_CONSTANT, value=(114, 114, 114))
+    
+    # BGR→RGB, HWC→CHW, normalize to [0,1], add batch
+    blob = padded[:, :, ::-1].astype(np.float32) / 255.0
+    blob = blob.transpose(2, 0, 1)[np.newaxis, ...]
+    
+    return blob, scale, (0, 0)  # (pad_top, pad_left)
+
+
+def postprocess_pose(output, scale, conf_threshold=0.25, iou_threshold=0.45):
+    """
+    Parse YOLOv8-Pose ONNX output.
+    Output shape: (1, 56, N) where 56 = 4 (bbox) + 1 (conf) + 17*3 (keypoints x,y,conf)
+    """
+    predictions = output[0]  # Shape: (1, 56, N)
+    if len(predictions.shape) == 3:
+        predictions = predictions[0]  # Shape: (56, N)
+    predictions = predictions.T  # Shape: (N, 56)
+    
+    # Filter by confidence
+    scores = predictions[:, 4]
+    mask = scores > conf_threshold
+    predictions = predictions[mask]
+    scores = scores[mask]
+    
+    if len(predictions) == 0:
+        return []
+    
+    # Extract boxes (x_center, y_center, w, h) → (x1, y1, x2, y2)
+    boxes = predictions[:, :4].copy()
+    boxes[:, 0] = predictions[:, 0] - predictions[:, 2] / 2  # x1
+    boxes[:, 1] = predictions[:, 1] - predictions[:, 3] / 2  # y1
+    boxes[:, 2] = predictions[:, 0] + predictions[:, 2] / 2  # x2
+    boxes[:, 3] = predictions[:, 1] + predictions[:, 3] / 2  # y2
+    
+    # NMS
+    indices = nms(boxes, scores, iou_threshold)
+    
+    results = []
+    for idx in indices:
+        box = boxes[idx] / scale  # Scale back to original image coords
+        score = float(scores[idx])
+        
+        # Extract 17 keypoints (x, y, conf each)
+        kp_raw = predictions[idx, 5:]  # 51 values = 17 * 3
+        keypoints = []
+        for k in range(17):
+            kx = float(kp_raw[k * 3] / scale)
+            ky = float(kp_raw[k * 3 + 1] / scale)
+            kc = float(kp_raw[k * 3 + 2])
+            keypoints.append([kx, ky, kc])
+        
+        results.append({
+            'box': box.tolist(),
+            'score': score,
+            'keypoints': np.array(keypoints),
+        })
+    
+    return results
+
+
+def nms(boxes, scores, iou_threshold):
+    """Non-Maximum Suppression."""
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    
+    order = scores.argsort()[::-1]
+    keep = []
+    
+    while len(order) > 0:
+        i = order[0]
+        keep.append(i)
+        
+        if len(order) == 1:
+            break
+        
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
+        inter = w * h
+        
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-8)
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+    
+    return keep
+
+
+# ── Analysis Functions ───────────────────────────────────────────────
+
+def smooth(arr, window=5):
+    if len(arr) < window:
+        return arr.copy()
+    kernel = np.ones(window) / window
+    return np.convolve(arr, kernel, mode='same')
+
+
+def angle_between(p1, p2, p3):
+    v1 = np.array([p1[0]-p2[0], p1[1]-p2[1]])
+    v2 = np.array([p3[0]-p2[0], p3[1]-p2[1]])
+    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if n1 < 1e-8 or n2 < 1e-8:
+        return 180.0
+    cos = np.dot(v1, v2) / (n1 * n2)
+    return math.degrees(math.acos(np.clip(cos, -1, 1)))
+
+
+def body_orientation(kps):
+    ls, rs = kps[KP['left_shoulder']], kps[KP['right_shoulder']]
+    dx = rs[0] - ls[0]
+    dy = rs[1] - ls[1]
+    return math.degrees(math.atan2(dy, dx))
+
+
+def extract_frame_data(video_path: str):
+    """Extract pose data from every frame using YOLOv8-Pose ONNX."""
+    session = get_session()
     cap = cv2.VideoCapture(video_path)
     
     if not cap.isOpened():
@@ -334,50 +215,280 @@ def extract_poses_from_video(video_path: str, sample_rate: int = 3) -> tuple:
     
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
     
-    poses = []
+    frame_data = []
     frame_idx = 0
+    
+    input_name = session.get_inputs()[0].name
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         
-        # Sample every Nth frame to speed up processing
-        if frame_idx % sample_rate == 0:
-            # Convert BGR to RGB
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Process with MediaPipe (lazy init)
-            results = get_pose().process(rgb_frame)
-            
-            if results.pose_landmarks:
-                keypoints = []
-                for i, landmark in enumerate(results.pose_landmarks.landmark):
-                    keypoints.append(Keypoint(
-                        x=landmark.x,
-                        y=landmark.y,
-                        z=landmark.z,
-                        visibility=landmark.visibility,
-                        name=KEYPOINT_NAMES[i] if i < len(KEYPOINT_NAMES) else f'point_{i}'
-                    ))
-                
-                poses.append(FramePose(
-                    frame=frame_idx,
-                    timestamp_ms=(frame_idx / fps) * 1000,
-                    keypoints=keypoints
-                ))
+        # Preprocess
+        blob, scale, pad = preprocess_frame(frame)
         
+        # Run ONNX inference
+        outputs = session.run(None, {input_name: blob})
+        
+        # Parse results
+        detections = postprocess_pose(outputs[0], scale)
+        
+        # Pick largest person (skater)
+        skater_kps = None
+        if detections:
+            # Sort by box area (largest first)
+            detections.sort(key=lambda d: (d['box'][2]-d['box'][0]) * (d['box'][3]-d['box'][1]), reverse=True)
+            skater_kps = detections[0]['keypoints']
+        
+        fd = {
+            'frame': frame_idx,
+            'time_ms': (frame_idx / fps) * 1000 if fps > 0 else 0,
+            'has_pose': skater_kps is not None,
+        }
+        
+        if skater_kps is not None:
+            lh, rh = skater_kps[KP['left_hip']], skater_kps[KP['right_hip']]
+            la, ra = skater_kps[KP['left_ankle']], skater_kps[KP['right_ankle']]
+            ls, rs = skater_kps[KP['left_shoulder']], skater_kps[KP['right_shoulder']]
+            lw, rw = skater_kps[KP['left_wrist']], skater_kps[KP['right_wrist']]
+            
+            fd.update({
+                'hip_y': float((lh[1] + rh[1]) / 2),
+                'hip_x': float((lh[0] + rh[0]) / 2),
+                'ankle_y': float(min(la[1], ra[1])),
+                'orientation': float(body_orientation(skater_kps)),
+                'knee_angle_l': float(angle_between(
+                    skater_kps[KP['left_hip']][:2],
+                    skater_kps[KP['left_knee']][:2],
+                    skater_kps[KP['left_ankle']][:2]
+                )),
+                'knee_angle_r': float(angle_between(
+                    skater_kps[KP['right_hip']][:2],
+                    skater_kps[KP['right_knee']][:2],
+                    skater_kps[KP['right_ankle']][:2]
+                )),
+                'shoulder_width': float(math.sqrt((rs[0]-ls[0])**2 + (rs[1]-ls[1])**2)),
+                'wrist_spread': float(math.sqrt((rw[0]-lw[0])**2 + (rw[1]-lw[1])**2)),
+                'ankle_diff': float(abs(la[1] - ra[1])),
+            })
+        
+        frame_data.append(fd)
         frame_idx += 1
     
     cap.release()
-    return poses, fps, total_frames
+    return frame_data, fps, total_frames, duration
+
+
+def detect_elements(frame_data, fps):
+    """Detect jumps and spins from pose trajectory."""
+    elements = []
+    if not frame_data or fps <= 0:
+        return elements
+    
+    # ── Jump Detection ───────────────────────────────────────────
+    hip_ys = np.array([fd.get('hip_y', 0) for fd in frame_data], dtype=float)
+    smoothed = smooth(hip_ys, window=max(3, int(fps/10)))
+    
+    window = max(3, int(fps * 0.3))
+    min_air_frames = max(3, int(fps * 0.12))
+    
+    jump_candidates = []
+    for i in range(window, len(smoothed) - window):
+        local_region = smoothed[i-window:i+window+1]
+        if smoothed[i] == np.min(local_region):
+            baseline_before = np.mean(smoothed[max(0, i-window*2):i-window]) if i > window*2 else smoothed[0]
+            baseline_after = np.mean(smoothed[i+window:min(len(smoothed), i+window*2)]) if i+window*2 < len(smoothed) else smoothed[-1]
+            baseline = (baseline_before + baseline_after) / 2
+            height = baseline - smoothed[i]
+            
+            if height > 15:
+                takeoff = i
+                for j in range(i, max(0, i-window*3), -1):
+                    if smoothed[j] >= baseline - 3:
+                        takeoff = j
+                        break
+                
+                landing = i
+                for j in range(i, min(len(smoothed), i+window*3)):
+                    if smoothed[j] >= baseline - 3:
+                        landing = j
+                        break
+                
+                jump_candidates.append((takeoff, i, landing, height))
+    
+    for start, apex_frame, end, height in jump_candidates:
+        if end - start >= min_air_frames:
+            orientations = [fd.get('orientation', 0) for fd in frame_data[start:end+1]]
+            total_rotation = 0
+            for j in range(1, len(orientations)):
+                diff = orientations[j] - orientations[j-1]
+                while diff > 180: diff -= 360
+                while diff < -180: diff += 360
+                total_rotation += abs(diff)
+            
+            rotations = round(total_rotation / 360 * 2) / 2
+            jump_type = classify_jump(frame_data, start, apex_frame, end, rotations)
+            air_time_ms = ((end - start) / fps) * 1000
+            feedback = generate_jump_feedback(frame_data, start, apex_frame, end, height, rotations, jump_type, fps)
+            score = calculate_jump_score(jump_type, rotations)
+            
+            elements.append(SkatingElement(
+                type='jump',
+                name=jump_type,
+                start_frame=start,
+                end_frame=end,
+                start_time=start / fps,
+                end_time=end / fps,
+                confidence=0.85,
+                score=score,
+                feedback=feedback,
+            ))
+    
+    # ── Spin Detection ───────────────────────────────────────────
+    jump_frames = set()
+    for e in elements:
+        for f in range(e.start_frame, e.end_frame + 1):
+            jump_frames.add(f)
+    
+    orientations = [fd.get('orientation', 0) for fd in frame_data]
+    rotation_speeds = [0]
+    for i in range(1, len(orientations)):
+        diff = orientations[i] - orientations[i-1]
+        while diff > 180: diff -= 360
+        while diff < -180: diff += 360
+        rotation_speeds.append(abs(diff) * fps)
+    
+    smoothed_speed = smooth(np.array(rotation_speeds), window=max(3, int(fps/5)))
+    
+    spin_threshold = 120
+    spin_start = None
+    for i in range(len(smoothed_speed)):
+        if i in jump_frames:
+            spin_start = None
+            continue
+        
+        if smoothed_speed[i] > spin_threshold and spin_start is None:
+            spin_start = i
+        elif (smoothed_speed[i] < spin_threshold or i == len(smoothed_speed)-1) and spin_start is not None:
+            duration_frames = i - spin_start
+            if duration_frames > fps * 0.5:
+                total_rot = sum(rotation_speeds[spin_start:i])
+                revolutions = total_rot / 360
+                avg_speed = np.mean(rotation_speeds[spin_start:i])
+                spin_pos = classify_spin_position(frame_data, spin_start, i)
+                
+                spin_feedback = [
+                    f"Detected: {spin_pos} Spin",
+                    f"{revolutions:.1f} revolutions at {avg_speed:.0f}°/s",
+                ]
+                if revolutions >= 6:
+                    spin_feedback.append("✅ Great revolution count!")
+                if avg_speed > 300:
+                    spin_feedback.append("✅ Fast rotation speed")
+                elif avg_speed < 180:
+                    spin_feedback.append("⚠️ Try pulling arms in tighter for more speed")
+                
+                spin_score = {'Sit': 1.8, 'Camel': 2.0}.get(spin_pos, 1.5)
+                if revolutions >= 6: spin_score += 0.5
+                if avg_speed > 300: spin_score += 0.3
+                
+                elements.append(SkatingElement(
+                    type='spin',
+                    name=f'{spin_pos} Spin',
+                    start_frame=spin_start,
+                    end_frame=i,
+                    start_time=spin_start / fps,
+                    end_time=i / fps,
+                    confidence=0.80,
+                    score=round(spin_score, 2),
+                    feedback=spin_feedback,
+                ))
+            spin_start = None
+    
+    return elements
+
+
+def classify_jump(frame_data, start, apex, end, rotations):
+    if rotations % 1 == 0.5:
+        return f"{rotation_prefix(rotations)} Axel"
+    
+    takeoff_start = max(start, apex - 5)
+    takeoff_frames = frame_data[takeoff_start:apex]
+    ankle_diffs = [fd.get('ankle_diff', 0) for fd in takeoff_frames if fd.get('has_pose')]
+    avg_ankle_diff = np.mean(ankle_diffs) if ankle_diffs else 0
+    
+    prefix = rotation_prefix(rotations)
+    if avg_ankle_diff > 20:
+        return f"{prefix} Toe Jump"
+    return f"{prefix} Edge Jump"
+
+
+def classify_spin_position(frame_data, start, end):
+    knee_angles = []
+    for fd in frame_data[start:end]:
+        if fd.get('has_pose'):
+            ka = min(fd.get('knee_angle_l', 180), fd.get('knee_angle_r', 180))
+            knee_angles.append(ka)
+    avg_knee = np.mean(knee_angles) if knee_angles else 180
+    if avg_knee < 110: return 'Sit'
+    elif avg_knee < 140: return 'Camel'
+    return 'Upright'
+
+
+def rotation_prefix(rotations):
+    r = int(rotations)
+    return {1: 'Single', 2: 'Double', 3: 'Triple'}.get(r, 'Quad' if r >= 4 else 'Single')
+
+
+def calculate_jump_score(jump_type, rotations):
+    base_values = {
+        1: {'Toe': 0.4, 'Edge': 0.5, 'Axel': 1.1},
+        2: {'Toe': 1.3, 'Edge': 1.7, 'Axel': 3.3},
+        3: {'Toe': 4.2, 'Edge': 4.9, 'Axel': 8.0},
+        4: {'Toe': 9.5, 'Edge': 10.5, 'Axel': 12.5},
+    }
+    r = max(1, min(4, int(rotations)))
+    if 'Axel' in jump_type: return base_values[r]['Axel']
+    elif 'Toe' in jump_type: return base_values[r]['Toe']
+    return base_values[r]['Edge']
+
+
+def generate_jump_feedback(frame_data, start, apex, end, height, rotations, jump_type, fps):
+    feedback = [f"Detected: {jump_type} ({rotations} rotations)"]
+    air_time_s = (end - start) / fps
+    feedback.append(f"Air time: ~{air_time_s:.2f}s")
+    
+    if height > 40:
+        feedback.append("✅ Excellent height!")
+    elif height > 20:
+        feedback.append("✅ Good height")
+    else:
+        feedback.append("⚠️ Work on getting more height")
+    
+    landing_frames = frame_data[max(0, end-3):end+1]
+    for fd in landing_frames:
+        if fd.get('has_pose'):
+            knee = min(fd.get('knee_angle_l', 180), fd.get('knee_angle_r', 180))
+            if knee < 150:
+                feedback.append("✅ Good knee bend on landing")
+            else:
+                feedback.append("⚠️ Bend knees more on landing")
+            break
+    
+    return feedback
+
+
+# ── API Endpoints ────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
     return {
         "service": "IceAnalysis API",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "engine": "yolov8-pose-onnx",
         "status": "running",
         "endpoints": {
             "POST /analyze": "Upload video for skating analysis",
@@ -385,88 +496,74 @@ async def root():
         }
     }
 
+
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    return {"status": "healthy", "engine": "yolov8-pose-onnx"}
+
 
 @app.post("/analyze", response_model=AnalysisResult)
-async def analyze_video(
-    video: UploadFile = File(...),
-    include_poses: bool = False,
-    sample_rate: int = 2  # Changed from 3 to 2 for better detection
-):
-    """
-    Analyze a figure skating video.
+async def analyze_video(video: UploadFile = File(...)):
+    """Analyze a figure skating video using YOLOv8-Pose (ONNX Runtime)."""
     
-    - **video**: Video file (mp4, mov, etc.)
-    - **include_poses**: Include full pose data in response (larger payload)
-    - **sample_rate**: Analyze every Nth frame (default 3, lower = more accurate but slower)
-    """
+    suffix = '.mp4'
+    if video.filename and video.filename.lower().endswith('.mov'):
+        suffix = '.mov'
     
-    # Validate file type
-    if not video.content_type or not video.content_type.startswith('video/'):
-        raise HTTPException(status_code=400, detail="File must be a video")
-    
-    # Save to temp file
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await video.read()
         tmp.write(content)
         tmp_path = tmp.name
     
     try:
-        # Extract poses
-        poses, fps, total_frames = extract_poses_from_video(tmp_path, sample_rate)
+        frame_data, fps, total_frames, duration = extract_frame_data(tmp_path)
+        poses_detected = sum(1 for fd in frame_data if fd['has_pose'])
         
-        if len(poses) < 10:
+        if poses_detected < 5:
             return AnalysisResult(
-                success=False,
+                success=True,
                 total_frames=total_frames,
                 fps=fps,
-                duration_seconds=total_frames / fps if fps > 0 else 0,
+                duration_seconds=duration,
                 elements=[],
-                session_feedback=["Could not detect skater in video. Make sure the full body is visible."],
-                poses=poses if include_poses else None
+                session_feedback=[
+                    f"Only detected skater in {poses_detected}/{total_frames} frames.",
+                    "Make sure the full body is visible with good lighting.",
+                ],
+                poses={'detection_rate': f"{poses_detected}/{total_frames}"},
             )
         
-        # Analyze poses
-        analyzer = SkatingAnalyzer()
-        for frame_pose in poses:
-            analyzer.analyze_frame(frame_pose.keypoints, frame_pose.frame, fps)
-        
-        # Detect elements
-        elements = analyzer.detect_elements(fps)
-        
-        # Generate session feedback
-        jumps = [e for e in elements if e.type == 'jump']
-        spins = [e for e in elements if e.type == 'spin']
+        elements = detect_elements(frame_data, fps)
         
         session_feedback = []
-        if jumps:
-            avg_score = sum(j.score for j in jumps) / len(jumps)
-            session_feedback.append(f"Jumps: {len(jumps)} detected, average score {avg_score:.1f}")
-        if spins:
-            avg_score = sum(s.score for s in spins) / len(spins)
-            session_feedback.append(f"Spins: {len(spins)} detected, average score {avg_score:.1f}")
+        for e in elements:
+            icon = "🏃" if e.type == 'jump' else "🔄"
+            session_feedback.append(f"{icon} {e.name} (score: {e.score})")
         
         if not elements:
             session_feedback.append("No elements detected. Try recording a longer clip with jumps or spins.")
+            session_feedback.append(f"(Skater detected in {poses_detected}/{total_frames} frames)")
         else:
-            session_feedback.append(f"Total elements: {len(elements)}")
+            total_score = sum(e.score for e in elements)
+            session_feedback.append(f"Total elements: {len(elements)}, Combined score: {total_score:.1f}")
         
         return AnalysisResult(
             success=True,
             total_frames=total_frames,
             fps=fps,
-            duration_seconds=total_frames / fps if fps > 0 else 0,
+            duration_seconds=duration,
             elements=elements,
             session_feedback=session_feedback,
-            poses=poses if include_poses else None
+            poses={
+                'detection_rate': f"{poses_detected}/{total_frames}",
+                'engine': 'yolov8-pose-onnx',
+            },
         )
-        
+    
     finally:
-        # Cleanup temp file
         os.unlink(tmp_path)
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
