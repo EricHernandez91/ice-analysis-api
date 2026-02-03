@@ -30,13 +30,23 @@ app.add_middleware(
 
 # ── YOLO-Pose ONNX Model ────────────────────────────────────────────
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "yolov8n-pose.onnx")
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov8n-pose.onnx")
+# Fallback: check /app/ (Docker workdir)
+if not os.path.exists(MODEL_PATH):
+    MODEL_PATH = "/app/yolov8n-pose.onnx"
 _session = None
+
+print(f"[STARTUP] Model path: {MODEL_PATH}, exists: {os.path.exists(MODEL_PATH)}")
+print(f"[STARTUP] onnxruntime version: {ort.__version__}")
+print(f"[STARTUP] Working directory: {os.getcwd()}")
+print(f"[STARTUP] Files in dir: {os.listdir(os.path.dirname(os.path.abspath(__file__)))[:10]}")
 
 def get_session():
     global _session
     if _session is None:
+        print(f"[MODEL] Loading ONNX model from {MODEL_PATH}...")
         _session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
+        print(f"[MODEL] Model loaded successfully")
     return _session
 
 # COCO keypoint indices (17 keypoints from YOLOv8-Pose)
@@ -482,6 +492,17 @@ def generate_jump_feedback(frame_data, start, apex, end, height, rotations, jump
 
 
 # ── API Endpoints ────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup_event():
+    """Preload model on startup to catch errors early."""
+    try:
+        session = get_session()
+        inp = session.get_inputs()[0]
+        print(f"[STARTUP] Model ready: input={inp.name} shape={inp.shape}")
+    except Exception as e:
+        print(f"[STARTUP] WARNING: Model load failed: {e}")
+        # Don't crash — let health check report the issue
 
 @app.get("/")
 async def root():
