@@ -377,87 +377,149 @@ def interpolate_frames(sampled_data, total_frames, fps):
 
 
 def detect_elements(frame_data, fps):
-    """Detect jumps and spins from pose trajectory."""
+    """Detect jumps and spins from pose trajectory.
+    
+    Jump detection: hip-Y trajectory local minima (= airborne apex).
+    Spin detection: sustained high rotation speed while stationary.
+    
+    Key thresholds tuned against real skating videos:
+    - Jumps need significant height (>25px) AND duration (>0.2s)
+    - Jumps must have at least 0.5 rotations (filter noise)
+    - Spins need sustained rotation (>1.5s) while staying in place
+    - Merge nearby jump candidates that are part of the same jump
+    """
     elements = []
     if not frame_data or fps <= 0:
         return elements
     
     # ── Jump Detection ───────────────────────────────────────────
     hip_ys = np.array([fd.get('hip_y', 0) for fd in frame_data], dtype=float)
-    smoothed = smooth(hip_ys, window=max(3, int(fps/10)))
+    smoothed = smooth(hip_ys, window=max(3, int(fps / 8)))
     
-    window = max(3, int(fps * 0.3))
-    min_air_frames = max(3, int(fps * 0.12))
+    window = max(4, int(fps * 0.35))
+    min_air_frames = max(4, int(fps * 0.2))  # At least 0.2s airborne
+    min_height = 25  # Minimum pixel height delta (was 15 — too low)
     
     jump_candidates = []
     for i in range(window, len(smoothed) - window):
-        local_region = smoothed[i-window:i+window+1]
+        local_region = smoothed[i - window:i + window + 1]
         if smoothed[i] == np.min(local_region):
-            baseline_before = np.mean(smoothed[max(0, i-window*2):i-window]) if i > window*2 else smoothed[0]
-            baseline_after = np.mean(smoothed[i+window:min(len(smoothed), i+window*2)]) if i+window*2 < len(smoothed) else smoothed[-1]
-            baseline = (baseline_before + baseline_after) / 2
-            height = baseline - smoothed[i]
+            # Use separate baselines for before/after (skater is moving)
+            before_start = max(0, i - window * 3)
+            before_end = max(0, i - window)
+            after_start = min(len(smoothed), i + window)
+            after_end = min(len(smoothed), i + window * 3)
             
-            if height > 15:
+            baseline_before = np.mean(smoothed[before_start:before_end]) if before_end > before_start else smoothed[0]
+            baseline_after = np.mean(smoothed[after_start:after_end]) if after_end > after_start else smoothed[-1]
+            height = max(baseline_before, baseline_after) - smoothed[i]
+            
+            if height > min_height:
+                # Find takeoff: go backward from apex, find the local max 
+                # (highest hip Y = skater on ice before jumping)
                 takeoff = i
-                for j in range(i, max(0, i-window*3), -1):
-                    if smoothed[j] >= baseline - 3:
+                for j in range(i - 1, max(0, i - window * 4), -1):
+                    if smoothed[j] >= baseline_before - 10:
                         takeoff = j
                         break
+                    # Also stop if hip starts going down again (we passed the takeoff)
+                    if j < i - 2 and smoothed[j] < smoothed[j + 1]:
+                        takeoff = j + 1
+                        break
                 
+                # Find landing: go forward from apex, find where hip returns 
+                # to post-jump baseline
                 landing = i
-                for j in range(i, min(len(smoothed), i+window*3)):
-                    if smoothed[j] >= baseline - 3:
+                for j in range(i + 1, min(len(smoothed), i + window * 4)):
+                    if smoothed[j] >= baseline_after - 10:
+                        landing = j
+                        break
+                    # Also stop if hip starts going down again (overshot)
+                    if j > i + 2 and smoothed[j] > smoothed[j - 1] and smoothed[j] > smoothed[i] + height * 0.6:
                         landing = j
                         break
                 
                 jump_candidates.append((takeoff, i, landing, height))
     
-    for start, apex_frame, end, height in jump_candidates:
-        if end - start >= min_air_frames:
-            orientations = [fd.get('orientation', 0) for fd in frame_data[start:end+1]]
-            total_rotation = 0
-            for j in range(1, len(orientations)):
-                diff = orientations[j] - orientations[j-1]
-                while diff > 180: diff -= 360
-                while diff < -180: diff += 360
-                total_rotation += abs(diff)
-            
-            rotations = round(total_rotation / 360 * 2) / 2
-            jump_type = classify_jump(frame_data, start, apex_frame, end, rotations)
-            air_time_ms = ((end - start) / fps) * 1000
-            feedback = generate_jump_feedback(frame_data, start, apex_frame, end, height, rotations, jump_type, fps)
-            score = calculate_jump_score(jump_type, rotations)
-            
-            elements.append(SkatingElement(
-                type='jump',
-                name=jump_type,
-                start_frame=start,
-                end_frame=end,
-                start_time=start / fps,
-                end_time=end / fps,
-                confidence=0.85,
-                score=score,
-                feedback=feedback,
-            ))
+    # Merge overlapping/nearby jump candidates (same jump detected multiple times)
+    merged = []
+    for cand in sorted(jump_candidates, key=lambda c: c[1]):
+        if merged and cand[0] <= merged[-1][2] + int(fps * 0.15):
+            # Overlaps with previous — keep the one with more height
+            prev = merged[-1]
+            if cand[3] > prev[3]:
+                merged[-1] = (min(prev[0], cand[0]), cand[1], max(prev[2], cand[2]), cand[3])
+            else:
+                merged[-1] = (min(prev[0], cand[0]), prev[1], max(prev[2], cand[2]), prev[3])
+        else:
+            merged.append(cand)
+    
+    for start, apex_frame, end, height in merged:
+        air_frames = end - start
+        if air_frames < min_air_frames:
+            print(f"[JUMP] Rejected apex@{apex_frame}: too short ({air_frames} frames)")
+            continue
+        
+        # Count rotation during the jump
+        orientations = [fd.get('orientation', 0) for fd in frame_data[start:end + 1]]
+        total_rotation = 0
+        for j in range(1, len(orientations)):
+            diff = orientations[j] - orientations[j - 1]
+            while diff > 180: diff -= 360
+            while diff < -180: diff += 360
+            total_rotation += abs(diff)
+        
+        rotations = round(total_rotation / 360 * 2) / 2
+        
+        # Filter: must have at least 0.5 rotations to be a real jump
+        if rotations < 0.5:
+            print(f"[JUMP] Rejected apex@{apex_frame}: only {rotations} rotations")
+            continue
+        
+        jump_type = classify_jump(frame_data, start, apex_frame, end, rotations)
+        feedback = generate_jump_feedback(frame_data, start, apex_frame, end, height, rotations, jump_type, fps)
+        score = calculate_jump_score(jump_type, rotations)
+        
+        air_time_s = air_frames / fps
+        confidence = min(0.95, 0.6 + (height / 100) + (rotations * 0.1))
+        
+        print(f"[JUMP] ✅ {jump_type}: {rotations} rot, height={height:.0f}px, air={air_time_s:.2f}s, frames {start}-{end}")
+        
+        elements.append(SkatingElement(
+            type='jump',
+            name=jump_type,
+            start_frame=start,
+            end_frame=end,
+            start_time=start / fps,
+            end_time=end / fps,
+            confidence=round(confidence, 2),
+            score=score,
+            feedback=feedback,
+        ))
     
     # ── Spin Detection ───────────────────────────────────────────
+    # Exclude jump frames + buffer around them (jumps have fast rotation too)
     jump_frames = set()
     for e in elements:
-        for f in range(e.start_frame, e.end_frame + 1):
+        buffer = int(fps * 0.3)  # 0.3s buffer around each jump
+        for f in range(max(0, e.start_frame - buffer), min(len(frame_data), e.end_frame + buffer + 1)):
             jump_frames.add(f)
     
     orientations = [fd.get('orientation', 0) for fd in frame_data]
-    rotation_speeds = [0]
+    hip_xs = [fd.get('hip_x', 0) for fd in frame_data]
+    
+    rotation_speeds = [0.0]
     for i in range(1, len(orientations)):
-        diff = orientations[i] - orientations[i-1]
+        diff = orientations[i] - orientations[i - 1]
         while diff > 180: diff -= 360
         while diff < -180: diff += 360
         rotation_speeds.append(abs(diff) * fps)
     
-    smoothed_speed = smooth(np.array(rotation_speeds), window=max(3, int(fps/5)))
+    smoothed_speed = smooth(np.array(rotation_speeds), window=max(3, int(fps / 4)))
     
-    spin_threshold = 120
+    spin_threshold = 150  # Higher threshold (was 120)
+    min_spin_duration = fps * 1.5  # At least 1.5 seconds (was 0.5 — way too low)
+    
     spin_start = None
     for i in range(len(smoothed_speed)):
         if i in jump_frames:
@@ -466,9 +528,20 @@ def detect_elements(frame_data, fps):
         
         if smoothed_speed[i] > spin_threshold and spin_start is None:
             spin_start = i
-        elif (smoothed_speed[i] < spin_threshold or i == len(smoothed_speed)-1) and spin_start is not None:
+        elif (smoothed_speed[i] < spin_threshold or i == len(smoothed_speed) - 1) and spin_start is not None:
             duration_frames = i - spin_start
-            if duration_frames > fps * 0.5:
+            
+            if duration_frames >= min_spin_duration:
+                # Check skater stays roughly in place (spin = stationary rotation)
+                spin_hip_xs = [hip_xs[f] for f in range(spin_start, i) if f < len(hip_xs)]
+                hip_x_range = max(spin_hip_xs) - min(spin_hip_xs) if spin_hip_xs else 999
+                
+                # If skater moved too much horizontally, it's not a spin
+                if hip_x_range > 150:
+                    print(f"[SPIN] Rejected frames {spin_start}-{i}: too much lateral movement ({hip_x_range:.0f}px)")
+                    spin_start = None
+                    continue
+                
                 total_rot = sum(rotation_speeds[spin_start:i])
                 revolutions = total_rot / 360
                 avg_speed = np.mean(rotation_speeds[spin_start:i])
@@ -489,6 +562,10 @@ def detect_elements(frame_data, fps):
                 if revolutions >= 6: spin_score += 0.5
                 if avg_speed > 300: spin_score += 0.3
                 
+                confidence = min(0.90, 0.5 + (revolutions / 20) + (0.1 if hip_x_range < 80 else 0))
+                
+                print(f"[SPIN] ✅ {spin_pos} Spin: {revolutions:.1f} rev, {avg_speed:.0f}°/s, frames {spin_start}-{i}")
+                
                 elements.append(SkatingElement(
                     type='spin',
                     name=f'{spin_pos} Spin',
@@ -496,12 +573,16 @@ def detect_elements(frame_data, fps):
                     end_frame=i,
                     start_time=spin_start / fps,
                     end_time=i / fps,
-                    confidence=0.80,
+                    confidence=round(confidence, 2),
                     score=round(spin_score, 2),
                     feedback=spin_feedback,
                 ))
+            else:
+                print(f"[SPIN] Rejected frames {spin_start}-{i}: too short ({duration_frames} frames, need {min_spin_duration:.0f})")
             spin_start = None
     
+    # Sort by start time
+    elements.sort(key=lambda e: e.start_frame)
     return elements
 
 
