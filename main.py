@@ -146,8 +146,14 @@ class SkatingAnalyzer:
         if len(self.frame_history) >= 10:
             baseline_ankle = sum(f['ankle_y'] for f in self.frame_history[-10:]) / 10
             # If ankle is significantly higher (lower y value) than baseline
-            if ankle_y < baseline_ankle - 0.05:  # 5% of frame height
+            # Lowered threshold from 0.05 to 0.02 for better detection of smaller jumps
+            if ankle_y < baseline_ankle - 0.02:  # 2% of frame height (more sensitive)
                 analysis['is_airborne'] = True
+            # Also check hip position change for jump detection
+            if len(self.frame_history) >= 5:
+                baseline_hip = sum(f['center_y'] for f in self.frame_history[-5:]) / 5
+                if center_y < baseline_hip - 0.03:  # Hip rises during jump
+                    analysis['is_airborne'] = True
         
         # Calculate rotation speed
         if len(self.frame_history) >= 1:
@@ -183,7 +189,7 @@ class SkatingAnalyzer:
             elif not frame['is_airborne'] and jump_start is not None:
                 # Jump ended
                 air_frames = i - jump_start
-                if air_frames >= 5:  # Minimum 5 frames airborne
+                if air_frames >= 2:  # Minimum 2 frames airborne (was 5 - too strict)
                     jump = self._classify_jump(
                         self.frame_history[jump_start:i],
                         total_rotation,
@@ -218,7 +224,8 @@ class SkatingAnalyzer:
     def _classify_jump(self, frames: list, total_rotation: float, fps: float) -> Optional[SkatingElement]:
         """Classify a detected jump."""
         rotations = total_rotation / 360
-        if rotations < 0.5:
+        # Accept even small jumps (waltz jumps are ~0.5 rotation, bunny hops less)
+        if rotations < 0.3:
             return None
         
         # Determine rotation count
@@ -386,7 +393,7 @@ async def health():
 async def analyze_video(
     video: UploadFile = File(...),
     include_poses: bool = False,
-    sample_rate: int = 3
+    sample_rate: int = 2  # Changed from 3 to 2 for better detection
 ):
     """
     Analyze a figure skating video.
