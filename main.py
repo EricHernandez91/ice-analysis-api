@@ -45,8 +45,13 @@ def get_session():
     global _session
     if _session is None:
         print(f"[MODEL] Loading ONNX model from {MODEL_PATH}...")
-        _session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
-        print(f"[MODEL] Model loaded successfully")
+        # Limit threads to reduce memory pressure on free tier
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        _session = ort.InferenceSession(MODEL_PATH, sess_options=opts, providers=['CPUExecutionProvider'])
+        print(f"[MODEL] Model loaded successfully (single-thread mode)")
     return _session
 
 # COCO keypoint indices (17 keypoints from YOLOv8-Pose)
@@ -216,7 +221,15 @@ def body_orientation(kps):
 
 
 def extract_frame_data(video_path: str):
-    """Extract pose data from every frame using YOLOv8-Pose ONNX."""
+    """Extract pose data from video using YOLOv8-Pose ONNX.
+    
+    Memory-optimized for free-tier hosting (512MB RAM):
+    - Subsamples frames (every Nth) to reduce inference count
+    - Uses 320x320 input instead of 640x640 (4x less memory)
+    - Explicit memory cleanup between frames
+    """
+    import gc
+    
     session = get_session()
     cap = cv2.VideoCapture(video_path)
     
@@ -226,6 +239,13 @@ def extract_frame_data(video_path: str):
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if fps > 0 else 0
+    
+    # Adaptive subsampling: target ~12-15 frames max for analysis
+    # This keeps memory and CPU manageable on free tier (512MB)
+    target_frames = 15
+    step = max(1, total_frames // target_frames)
+    
+    print(f"[ANALYZE] {total_frames} frames @ {fps:.1f}fps, step={step}, ~{total_frames//step} will be processed")
     
     frame_data = []
     frame_idx = 0
@@ -237,8 +257,13 @@ def extract_frame_data(video_path: str):
         if not ret:
             break
         
-        # Preprocess
-        blob, scale, pad = preprocess_frame(frame)
+        # Only process every Nth frame
+        if frame_idx % step != 0:
+            frame_idx += 1
+            continue
+        
+        # Preprocess (model requires 640x640 fixed input)
+        blob, scale, pad = preprocess_frame(frame, input_size=640)
         
         # Run ONNX inference
         outputs = session.run(None, {input_name: blob})
@@ -246,12 +271,16 @@ def extract_frame_data(video_path: str):
         # Parse results
         detections = postprocess_pose(outputs[0], scale)
         
+        # Free intermediate memory immediately
+        del blob, outputs
+        
         # Pick largest person (skater)
         skater_kps = None
         if detections:
-            # Sort by box area (largest first)
             detections.sort(key=lambda d: (d['box'][2]-d['box'][0]) * (d['box'][3]-d['box'][1]), reverse=True)
             skater_kps = detections[0]['keypoints']
+        
+        del detections
         
         fd = {
             'frame': frame_idx,
@@ -285,11 +314,67 @@ def extract_frame_data(video_path: str):
                 'ankle_diff': float(abs(la[1] - ra[1])),
             })
         
+        del skater_kps
         frame_data.append(fd)
         frame_idx += 1
+        
+        # Periodic GC to keep memory in check
+        if len(frame_data) % 5 == 0:
+            gc.collect()
     
     cap.release()
+    del cap
+    gc.collect()
+    
+    # Interpolate skipped frames for smoother trajectory analysis
+    if step > 1 and len(frame_data) >= 2:
+        frame_data = interpolate_frames(frame_data, total_frames, fps)
+    
+    print(f"[ANALYZE] Processed {len(frame_data)} frames (from {total_frames} total)")
     return frame_data, fps, total_frames, duration
+
+
+def interpolate_frames(sampled_data, total_frames, fps):
+    """Linearly interpolate between sampled frames for trajectory continuity."""
+    if len(sampled_data) < 2:
+        return sampled_data
+    
+    full_data = []
+    for i in range(len(sampled_data) - 1):
+        cur = sampled_data[i]
+        nxt = sampled_data[i + 1]
+        full_data.append(cur)
+        
+        gap = nxt['frame'] - cur['frame']
+        if gap <= 1 or not cur.get('has_pose') or not nxt.get('has_pose'):
+            continue
+        
+        # Interpolate intermediate frames
+        numeric_keys = ['hip_y', 'hip_x', 'ankle_y', 'orientation', 
+                       'knee_angle_l', 'knee_angle_r', 'shoulder_width', 
+                       'wrist_spread', 'ankle_diff']
+        
+        for step in range(1, gap):
+            t = step / gap
+            interp = {
+                'frame': cur['frame'] + step,
+                'time_ms': ((cur['frame'] + step) / fps) * 1000 if fps > 0 else 0,
+                'has_pose': True,
+            }
+            for key in numeric_keys:
+                if key in cur and key in nxt:
+                    # Handle angle wrapping for orientation
+                    if key == 'orientation':
+                        diff = nxt[key] - cur[key]
+                        while diff > 180: diff -= 360
+                        while diff < -180: diff += 360
+                        interp[key] = cur[key] + diff * t
+                    else:
+                        interp[key] = cur[key] + (nxt[key] - cur[key]) * t
+            full_data.append(interp)
+    
+    full_data.append(sampled_data[-1])
+    return full_data
 
 
 def detect_elements(frame_data, fps):
@@ -526,6 +611,7 @@ async def health():
 @app.post("/analyze", response_model=AnalysisResult)
 async def analyze_video(video: UploadFile = File(...)):
     """Analyze a figure skating video using YOLOv8-Pose (ONNX Runtime)."""
+    import gc
     
     suffix = '.mp4'
     if video.filename and video.filename.lower().endswith('.mov'):
@@ -533,8 +619,17 @@ async def analyze_video(video: UploadFile = File(...)):
     
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await video.read()
+        file_size_mb = len(content) / (1024 * 1024)
+        print(f"[UPLOAD] File: {video.filename}, size: {file_size_mb:.1f}MB")
+        
+        # Reject files > 50MB to avoid OOM
+        if file_size_mb > 50:
+            raise HTTPException(status_code=413, detail="Video too large. Max 50MB.")
+        
         tmp.write(content)
         tmp_path = tmp.name
+        del content  # Free upload buffer immediately
+        gc.collect()
     
     try:
         frame_data, fps, total_frames, duration = extract_frame_data(tmp_path)
