@@ -432,30 +432,29 @@ def calculate_jump_metrics(frame_data, start, apex, end, height, rotations, jump
     pre_start = max(0, start - int(fps * 0.5))
     pre_frames = [fd for fd in frame_data[pre_start:start] if fd.get('has_pose')]
     
+    # Estimate standing height from pixel-space shoulder-to-ankle distance
+    # hip_y, ankle_y are in pixel coordinates; use those consistently
     standing_heights = []
     for fd in pre_frames:
-        if '_raw_keypoints' not in fd:
-            # Use raw pixel coords: shoulder midpoint to ankle midpoint
-            sh_y = fd.get('hip_y', 0) - fd.get('shoulder_width', 0) * 0.5  # rough approx
-            ank_y = fd.get('ankle_y', 0)
-            if ank_y > 0:
-                standing_heights.append(abs(ank_y - sh_y))
-        else:
-            kps = fd['_raw_keypoints']
-            # shoulder midpoint Y to ankle midpoint Y (normalized, but consistent)
-            sh_mid_y = (kps[KP['left_shoulder']][1] + kps[KP['right_shoulder']][1]) / 2
-            ank_mid_y = (kps[KP['left_ankle']][1] + kps[KP['right_ankle']][1]) / 2
-            h = abs(ank_mid_y - sh_mid_y)
-            if h > 0.05:  # at least 5% of frame height
-                standing_heights.append(h)
+        hip_y = fd.get('hip_y', 0)
+        ankle_y = fd.get('ankle_y', 0)
+        if hip_y > 0 and ankle_y > 0:
+            # hip-to-ankle is roughly 50% of full standing height
+            # full standing height ≈ hip_to_ankle * 2
+            hip_to_ankle = abs(ankle_y - hip_y)
+            if hip_to_ankle > 10:  # sanity check
+                standing_heights.append(hip_to_ankle * 2.0)
     
-    # Also try using hip_y and ankle_y from the numeric fields
+    # If no pre-jump frames, try all frames with pose data
     if not standing_heights:
-        for fd in pre_frames:
-            hip_y = fd.get('hip_y', 0)
-            ankle_y = fd.get('ankle_y', 0)
-            if hip_y > 0 and ankle_y > 0:
-                standing_heights.append(abs(ankle_y - hip_y) * 2.5)  # hip-ankle is ~40% of height
+        for fd in frame_data:
+            if fd.get('has_pose'):
+                hip_y = fd.get('hip_y', 0)
+                ankle_y = fd.get('ankle_y', 0)
+                if hip_y > 0 and ankle_y > 0:
+                    hip_to_ankle = abs(ankle_y - hip_y)
+                    if hip_to_ankle > 10:
+                        standing_heights.append(hip_to_ankle * 2.0)
     
     standing_height = np.mean(standing_heights) if standing_heights else 0
     
