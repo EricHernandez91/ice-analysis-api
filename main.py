@@ -516,8 +516,12 @@ def calculate_jump_metrics(frame_data, start, apex, end, height, rotations, jump
     metrics['pre_rotation_deg'] = round(pre_rotation, 1)
     
     # ── Under-rotation ──
+    # total_rotation_deg uses the rounded rotations (e.g., 1.5 for Axel = 540°)
+    # total_target is the ISU expected rotation (e.g., 540° for Single Axel)
+    # If rounded correctly, these should match. Only flag significant mismatches.
     under_rotation = max(0, total_target - total_rotation_deg)
-    metrics['under_rotation_deg'] = round(under_rotation, 1)
+    # Suppress small values — 2D measurement noise is ±90° at minimum
+    metrics['under_rotation_deg'] = round(under_rotation, 1) if under_rotation > 45 else 0
     
     # ── Tuck tightness ──
     air_frames = [fd for fd in frame_data[start:end+1] if fd.get('has_pose')]
@@ -681,29 +685,29 @@ def generate_detailed_feedback(element_type, metrics):
             feedback.append(f"⚠️ Work on jump height — only {hr}x body height")
         
         # ── Rotation speed / tuck ──
+        # Tuck feedback only meaningful for doubles and above (singles don't fully tuck)
         rspeed = metrics.get('rotation_speed_dps', 0)
         tuck = metrics.get('tuck_tightness', 1.0)
-        if tuck < 0.5 and rspeed > 800:
-            feedback.append(f"✅ Tight tuck — rotation speed {rspeed}°/s")
-        elif tuck >= 0.7:
-            feedback.append(f"⚠️ Arms too wide in air — tuck tighter for faster rotation")
-        elif rspeed > 600:
-            feedback.append(f"✅ Good rotation speed ({rspeed}°/s)")
+        # Estimate rotation count from rotation speed and air time
+        air_t = metrics.get('air_time_s', 0)
+        rot_count = max(1, round(rspeed * air_t / 360)) if air_t > 0 and rspeed > 0 else 1
+        if rot_count >= 2:
+            if tuck < 0.5 and rspeed > 800:
+                feedback.append(f"✅ Tight tuck — rotation speed {rspeed}°/s")
+            elif tuck >= 0.8:
+                feedback.append(f"⚠️ Arms too wide in air — tuck tighter for faster rotation")
+            elif rspeed > 600:
+                feedback.append(f"✅ Good rotation speed ({rspeed}°/s)")
         
-        # ── Pre-rotation ──
-        pre_rot = metrics.get('pre_rotation_deg', 0)
-        if pre_rot > 30:
-            feedback.append(f"⚠️ Pre-rotating {pre_rot:.0f}° before takeoff — try to leave the ice before starting rotation")
-        elif pre_rot > 15:
-            feedback.append(f"Minor pre-rotation ({pre_rot:.0f}°) — within acceptable range")
+        # Pre-rotation detection removed — 2D shoulder tracking picks up normal
+        # skating movement as false pre-rotation. Would need 3D pose or edge
+        # detection (blade angle) to measure this reliably.
         
         # ── Under-rotation ──
         under_rot = metrics.get('under_rotation_deg', 0)
-        if under_rot > 45:
-            feedback.append(f"⚠️ Under-rotated by {under_rot:.0f}° — focus on completing the rotation before landing")
-        elif under_rot > 20:
-            feedback.append(f"⚠️ Slightly under-rotated by {under_rot:.0f}°")
-        elif under_rot <= 10:
+        if under_rot > 90:
+            feedback.append(f"⚠️ Under-rotated by ~{under_rot:.0f}° — focus on completing the rotation before landing")
+        elif under_rot <= 45:
             feedback.append(f"✅ Fully rotated!")
         
         # ── Landing ──
@@ -723,11 +727,13 @@ def generate_detailed_feedback(element_type, metrics):
             feedback.append("⚠️ Slow approach — more speed helps with height")
         
         # ── Takeoff lean ──
+        # 2D lean measurement is heavily affected by camera angle.
+        # Only flag extreme lean (>35°) to avoid false warnings.
         lean = metrics.get('takeoff_lean_deg', 0)
-        if lean > 20:
-            feedback.append(f"⚠️ Too much lean at takeoff ({lean:.0f}°) — stay more upright")
-        elif lean > 0 and lean < 15:
-            feedback.append(f"✅ Good takeoff posture ({lean:.0f}° lean)")
+        if lean > 35:
+            feedback.append(f"⚠️ Significant lean at takeoff ({lean:.0f}°) — try to stay more upright")
+        elif 5 < lean < 20:
+            feedback.append(f"✅ Good takeoff posture")
     
     elif element_type == 'spin':
         # ── Speed ──
