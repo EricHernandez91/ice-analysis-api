@@ -472,8 +472,11 @@ def detect_elements(frame_data, fps):
             print(f"[JUMP] Rejected apex@{apex_frame}: too short ({air_frames} frames)")
             continue
         
-        # Count rotation during the jump
-        orientations = [fd.get('orientation', 0) for fd in frame_data[start:end + 1]]
+        # Count rotation during the jump — extend window slightly
+        # because rotation starts just before takeoff and ends just after landing
+        rot_start = max(0, start - int(fps * 0.1))
+        rot_end = min(len(frame_data) - 1, end + int(fps * 0.1))
+        orientations = [fd.get('orientation', 0) for fd in frame_data[rot_start:rot_end + 1]]
         total_rotation = 0
         for j in range(1, len(orientations)):
             diff = orientations[j] - orientations[j - 1]
@@ -495,7 +498,8 @@ def detect_elements(frame_data, fps):
         air_time_s = air_frames / fps
         confidence = min(0.95, 0.6 + (height / 100) + (rotations * 0.1))
         
-        print(f"[JUMP] ✅ {jump_type}: {rotations} rot, height={height:.0f}px, air={air_time_s:.2f}s, frames {start}-{end}")
+        raw_rot = total_rotation / 360
+        print(f"[JUMP] ✅ {jump_type}: {rotations} rot (raw: {raw_rot:.2f}), height={height:.0f}px, air={air_time_s:.2f}s, frames {start}-{end}")
         
         elements.append(SkatingElement(
             type='jump',
@@ -599,9 +603,24 @@ def detect_elements(frame_data, fps):
 
 
 def classify_jump(frame_data, start, apex, end, rotations):
-    if rotations % 1 == 0.5:
-        return f"{rotation_prefix(rotations)} Axel"
+    """Classify jump type based on rotation count and takeoff characteristics.
     
+    Axels always have half-rotation extra (1.5, 2.5, 3.5) because they
+    take off forward. We use a tolerance band since subsampled frames
+    may not measure rotation precisely.
+    """
+    # Check if rotations are near a half-value (Axel signature)
+    # Tolerance: within 0.3 of a .5 value (e.g., 1.2-1.8 → Axel)
+    fractional = rotations % 1.0
+    is_axel = (0.2 <= fractional <= 0.8)
+    
+    if is_axel:
+        # Round to nearest .5 for proper Axel naming
+        axel_rotations = round(rotations * 2) / 2
+        if axel_rotations % 1.0 == 0.5:
+            return f"{rotation_prefix(axel_rotations)} Axel"
+    
+    # For non-Axel jumps, check takeoff for toe vs edge
     takeoff_start = max(start, apex - 5)
     takeoff_frames = frame_data[takeoff_start:apex]
     ankle_diffs = [fd.get('ankle_diff', 0) for fd in takeoff_frames if fd.get('has_pose')]
@@ -609,8 +628,8 @@ def classify_jump(frame_data, start, apex, end, rotations):
     
     prefix = rotation_prefix(rotations)
     if avg_ankle_diff > 20:
-        return f"{prefix} Toe Jump"
-    return f"{prefix} Edge Jump"
+        return f"{prefix} Toe Loop"
+    return f"{prefix} Salchow"
 
 
 def classify_spin_position(frame_data, start, end):
@@ -631,16 +650,21 @@ def rotation_prefix(rotations):
 
 
 def calculate_jump_score(jump_type, rotations):
+    """ISU 2024-25 base values for jumps."""
+    # Full ISU base value table
     base_values = {
-        1: {'Toe': 0.4, 'Edge': 0.5, 'Axel': 1.1},
-        2: {'Toe': 1.3, 'Edge': 1.7, 'Axel': 3.3},
-        3: {'Toe': 4.2, 'Edge': 4.9, 'Axel': 8.0},
-        4: {'Toe': 9.5, 'Edge': 10.5, 'Axel': 12.5},
+        1: {'Toe Loop': 0.4, 'Salchow': 0.4, 'Loop': 0.5, 'Flip': 0.5, 'Lutz': 0.6, 'Axel': 1.1},
+        2: {'Toe Loop': 1.3, 'Salchow': 1.3, 'Loop': 1.7, 'Flip': 1.8, 'Lutz': 2.1, 'Axel': 3.3},
+        3: {'Toe Loop': 4.2, 'Salchow': 4.3, 'Loop': 4.9, 'Flip': 5.3, 'Lutz': 5.9, 'Axel': 8.0},
+        4: {'Toe Loop': 9.5, 'Salchow': 9.7, 'Loop': 10.5, 'Flip': 11.0, 'Lutz': 11.5, 'Axel': 12.5},
     }
     r = max(1, min(4, int(rotations)))
-    if 'Axel' in jump_type: return base_values[r]['Axel']
-    elif 'Toe' in jump_type: return base_values[r]['Toe']
-    return base_values[r]['Edge']
+    # Match jump type to base value table
+    for jump_name, bv in base_values[r].items():
+        if jump_name in jump_type:
+            return bv
+    # Fallback
+    return base_values[r].get('Toe Loop', 0.4)
 
 
 def generate_jump_feedback(frame_data, start, apex, end, height, rotations, jump_type, fps):
