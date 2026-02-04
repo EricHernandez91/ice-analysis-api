@@ -420,6 +420,351 @@ def interpolate_frames(sampled_data, total_frames, fps):
     return full_data
 
 
+def calculate_jump_metrics(frame_data, start, apex, end, height, rotations, jump_type, fps):
+    """Calculate detailed biomechanical metrics for a detected jump."""
+    metrics = {}
+    
+    air_time_s = (end - start) / fps if fps > 0 else 0
+    metrics['air_time_s'] = round(air_time_s, 3)
+    
+    # ── Height relative to standing height ──
+    # Estimate standing height from shoulder-to-ankle distance in pre-jump frames
+    pre_start = max(0, start - int(fps * 0.5))
+    pre_frames = [fd for fd in frame_data[pre_start:start] if fd.get('has_pose')]
+    
+    standing_heights = []
+    for fd in pre_frames:
+        if '_raw_keypoints' not in fd:
+            # Use raw pixel coords: shoulder midpoint to ankle midpoint
+            sh_y = fd.get('hip_y', 0) - fd.get('shoulder_width', 0) * 0.5  # rough approx
+            ank_y = fd.get('ankle_y', 0)
+            if ank_y > 0:
+                standing_heights.append(abs(ank_y - sh_y))
+        else:
+            kps = fd['_raw_keypoints']
+            # shoulder midpoint Y to ankle midpoint Y (normalized, but consistent)
+            sh_mid_y = (kps[KP['left_shoulder']][1] + kps[KP['right_shoulder']][1]) / 2
+            ank_mid_y = (kps[KP['left_ankle']][1] + kps[KP['right_ankle']][1]) / 2
+            h = abs(ank_mid_y - sh_mid_y)
+            if h > 0.05:  # at least 5% of frame height
+                standing_heights.append(h)
+    
+    # Also try using hip_y and ankle_y from the numeric fields
+    if not standing_heights:
+        for fd in pre_frames:
+            hip_y = fd.get('hip_y', 0)
+            ankle_y = fd.get('ankle_y', 0)
+            if hip_y > 0 and ankle_y > 0:
+                standing_heights.append(abs(ankle_y - hip_y) * 2.5)  # hip-ankle is ~40% of height
+    
+    standing_height = np.mean(standing_heights) if standing_heights else 0
+    
+    if standing_height > 0 and height > 0:
+        height_relative = round(height / standing_height, 2)
+    else:
+        height_relative = 0
+    metrics['height_relative'] = height_relative
+    
+    # ── Rotation speed (degrees per second) ──
+    # Target rotation for jump type
+    target_rotations_map = {
+        'Single': 360, 'Double': 720, 'Triple': 1080, 'Quad': 1440,
+    }
+    # Axels add 180° (half extra rotation)
+    is_axel = 'Axel' in jump_type
+    total_target = 360  # default
+    for prefix, deg in target_rotations_map.items():
+        if prefix in jump_type:
+            total_target = deg + (180 if is_axel else 0)
+            break
+    
+    total_rotation_deg = rotations * 360
+    rotation_speed_dps = round(total_rotation_deg / air_time_s) if air_time_s > 0 else 0
+    metrics['rotation_speed_dps'] = rotation_speed_dps
+    
+    # ── Peak rotation speed ──
+    orientations = [fd.get('orientation', 0) for fd in frame_data[start:end+1]]
+    frame_rot_speeds = []
+    for j in range(1, len(orientations)):
+        diff = orientations[j] - orientations[j-1]
+        while diff > 180: diff -= 360
+        while diff < -180: diff += 360
+        speed = abs(diff) * fps  # degrees per second
+        frame_rot_speeds.append(speed)
+    
+    peak_rotation_speed = round(max(frame_rot_speeds)) if frame_rot_speeds else 0
+    metrics['peak_rotation_speed_dps'] = peak_rotation_speed
+    
+    # ── Pre-rotation ──
+    pre_rot_window = int(fps * 0.2)  # 0.2s before takeoff
+    pre_rot_start = max(0, start - pre_rot_window)
+    pre_orientations = [fd.get('orientation', 0) for fd in frame_data[pre_rot_start:start+1]]
+    pre_rotation = 0
+    for j in range(1, len(pre_orientations)):
+        diff = pre_orientations[j] - pre_orientations[j-1]
+        while diff > 180: diff -= 360
+        while diff < -180: diff += 360
+        pre_rotation += abs(diff)
+    metrics['pre_rotation_deg'] = round(pre_rotation, 1)
+    
+    # ── Under-rotation ──
+    under_rotation = max(0, total_target - total_rotation_deg)
+    metrics['under_rotation_deg'] = round(under_rotation, 1)
+    
+    # ── Tuck tightness ──
+    air_frames = [fd for fd in frame_data[start:end+1] if fd.get('has_pose')]
+    wrist_spreads = [fd.get('wrist_spread', 0) for fd in air_frames if fd.get('wrist_spread', 0) > 0]
+    shoulder_widths = [fd.get('shoulder_width', 0) for fd in air_frames if fd.get('shoulder_width', 0) > 0]
+    
+    if wrist_spreads and shoulder_widths:
+        avg_wrist = np.mean(wrist_spreads)
+        avg_shoulder = np.mean(shoulder_widths)
+        tuck = round(avg_wrist / avg_shoulder, 2) if avg_shoulder > 0 else 1.0
+    else:
+        tuck = 1.0
+    metrics['tuck_tightness'] = tuck
+    
+    # ── Landing knee angle ──
+    landing_window = frame_data[max(0, end-3):end+2]
+    landing_knee = 180
+    for fd in landing_window:
+        if fd.get('has_pose'):
+            ka = min(fd.get('knee_angle_l', 180), fd.get('knee_angle_r', 180))
+            landing_knee = ka
+            break
+    metrics['landing_knee_angle'] = round(landing_knee, 1)
+    
+    # ── Entry speed ──
+    entry_window = int(fps * 0.3)
+    entry_start = max(0, start - entry_window)
+    entry_frames = [fd for fd in frame_data[entry_start:start+1] if fd.get('has_pose') and fd.get('hip_x', 0) > 0]
+    
+    if len(entry_frames) >= 2:
+        hip_xs = [fd['hip_x'] for fd in entry_frames]
+        total_movement = sum(abs(hip_xs[i] - hip_xs[i-1]) for i in range(1, len(hip_xs)))
+        entry_speed_px = round(total_movement / len(hip_xs), 1)
+    else:
+        entry_speed_px = 0
+    metrics['entry_speed_px'] = entry_speed_px
+    
+    # Classify entry speed qualitatively
+    if entry_speed_px > 8:
+        metrics['entry_speed'] = 'fast'
+    elif entry_speed_px > 4:
+        metrics['entry_speed'] = 'moderate'
+    else:
+        metrics['entry_speed'] = 'slow'
+    
+    # ── Takeoff lean angle ──
+    takeoff_frames = [fd for fd in frame_data[max(0, start-2):start+3] if fd.get('has_pose')]
+    takeoff_lean = 0
+    if takeoff_frames and '_raw_keypoints' in takeoff_frames[0]:
+        kps = takeoff_frames[0]['_raw_keypoints']
+        sh_mid_x = (kps[KP['left_shoulder']][0] + kps[KP['right_shoulder']][0]) / 2
+        sh_mid_y = (kps[KP['left_shoulder']][1] + kps[KP['right_shoulder']][1]) / 2
+        hip_mid_x = (kps[KP['left_hip']][0] + kps[KP['right_hip']][0]) / 2
+        hip_mid_y = (kps[KP['left_hip']][1] + kps[KP['right_hip']][1]) / 2
+        
+        dx = sh_mid_x - hip_mid_x
+        dy = sh_mid_y - hip_mid_y  # In image coords, Y increases downward
+        # Angle from vertical: vertical is dy < 0 (shoulder above hip)
+        if abs(dy) > 0.001:
+            takeoff_lean = abs(math.degrees(math.atan2(dx, -dy)))
+    elif takeoff_frames:
+        # Fallback: use hip_x movement as rough proxy for lean
+        fd = takeoff_frames[0]
+        hip_x = fd.get('hip_x', 0)
+        hip_y = fd.get('hip_y', 0)
+        # Very rough estimate
+        takeoff_lean = 5  # default small lean
+    
+    metrics['takeoff_lean_deg'] = round(takeoff_lean, 1)
+    
+    return metrics
+
+
+def calculate_spin_metrics(frame_data, start, end, fps):
+    """Calculate detailed biomechanical metrics for a detected spin."""
+    metrics = {}
+    
+    duration_s = (end - start) / fps if fps > 0 else 0
+    
+    # ── Rotation data ──
+    orientations = [fd.get('orientation', 0) for fd in frame_data[start:end+1]]
+    rotation_speeds = []  # degrees per second per frame
+    for j in range(1, len(orientations)):
+        diff = orientations[j] - orientations[j-1]
+        while diff > 180: diff -= 360
+        while diff < -180: diff += 360
+        speed = abs(diff) * fps
+        rotation_speeds.append(speed)
+    
+    total_rot = sum(abs(d) for d in rotation_speeds) / fps if fps > 0 else 0
+    revolutions = total_rot / 360
+    metrics['revolutions'] = round(revolutions, 1)
+    
+    # ── Average RPM ──
+    avg_dps = np.mean(rotation_speeds) if rotation_speeds else 0
+    avg_rpm = round(avg_dps / 6, 1)  # 360°/s = 60 RPM, so dps/6 = RPM
+    metrics['avg_rpm'] = avg_rpm
+    
+    # ── Peak RPM ──
+    if rotation_speeds:
+        # Smooth a bit to avoid noise spikes
+        smoothed_speeds = smooth(np.array(rotation_speeds), window=max(3, int(fps / 6)))
+        peak_dps = float(np.max(smoothed_speeds))
+        peak_rpm = round(peak_dps / 6, 1)
+    else:
+        peak_rpm = 0
+    metrics['peak_rpm'] = peak_rpm
+    
+    # ── Centering ──
+    hip_xs = [fd.get('hip_x', 0) for fd in frame_data[start:end+1] if fd.get('has_pose')]
+    if hip_xs:
+        centering = round(max(hip_xs) - min(hip_xs), 1)
+    else:
+        centering = 0
+    metrics['centering_px'] = centering
+    
+    # ── Speed profile ──
+    if len(rotation_speeds) >= 4:
+        mid = len(rotation_speeds) // 2
+        first_half_avg = np.mean(rotation_speeds[:mid])
+        second_half_avg = np.mean(rotation_speeds[mid:])
+        ratio = second_half_avg / first_half_avg if first_half_avg > 0 else 1.0
+        if ratio > 1.15:
+            speed_profile = 'accelerating'
+        elif ratio < 0.85:
+            speed_profile = 'decelerating'
+        else:
+            speed_profile = 'steady'
+    else:
+        speed_profile = 'steady'
+    metrics['speed_profile'] = speed_profile
+    
+    # ── Position consistency ──
+    knee_angles = []
+    for fd in frame_data[start:end+1]:
+        if fd.get('has_pose'):
+            ka = min(fd.get('knee_angle_l', 180), fd.get('knee_angle_r', 180))
+            knee_angles.append(ka)
+    
+    if len(knee_angles) >= 3:
+        position_consistency = round(float(np.std(knee_angles)), 1)
+    else:
+        position_consistency = 0
+    metrics['position_consistency'] = position_consistency
+    
+    return metrics
+
+
+def generate_detailed_feedback(element_type, metrics):
+    """Generate specific, actionable coaching tips based on detailed metrics."""
+    feedback = []
+    
+    if element_type == 'jump':
+        # ── Height ──
+        hr = metrics.get('height_relative', 0)
+        if hr >= 1.0:
+            feedback.append(f"✅ Excellent height ({hr}x body height)")
+        elif hr >= 0.7:
+            feedback.append(f"✅ Good height ({hr}x body height)")
+        elif hr > 0:
+            feedback.append(f"⚠️ Work on jump height — only {hr}x body height")
+        
+        # ── Rotation speed / tuck ──
+        rspeed = metrics.get('rotation_speed_dps', 0)
+        tuck = metrics.get('tuck_tightness', 1.0)
+        if tuck < 0.5 and rspeed > 800:
+            feedback.append(f"✅ Tight tuck — rotation speed {rspeed}°/s")
+        elif tuck >= 0.7:
+            feedback.append(f"⚠️ Arms too wide in air — tuck tighter for faster rotation")
+        elif rspeed > 600:
+            feedback.append(f"✅ Good rotation speed ({rspeed}°/s)")
+        
+        # ── Pre-rotation ──
+        pre_rot = metrics.get('pre_rotation_deg', 0)
+        if pre_rot > 30:
+            feedback.append(f"⚠️ Pre-rotating {pre_rot:.0f}° before takeoff — try to leave the ice before starting rotation")
+        elif pre_rot > 15:
+            feedback.append(f"Minor pre-rotation ({pre_rot:.0f}°) — within acceptable range")
+        
+        # ── Under-rotation ──
+        under_rot = metrics.get('under_rotation_deg', 0)
+        if under_rot > 45:
+            feedback.append(f"⚠️ Under-rotated by {under_rot:.0f}° — focus on completing the rotation before landing")
+        elif under_rot > 20:
+            feedback.append(f"⚠️ Slightly under-rotated by {under_rot:.0f}°")
+        elif under_rot <= 10:
+            feedback.append(f"✅ Fully rotated!")
+        
+        # ── Landing ──
+        knee = metrics.get('landing_knee_angle', 180)
+        if knee < 140:
+            feedback.append(f"✅ Solid landing — good knee bend at {knee:.0f}°")
+        elif knee < 155:
+            feedback.append(f"✅ Decent landing at {knee:.0f}°")
+        else:
+            feedback.append(f"⚠️ Stiff landing at {knee:.0f}° — bend knees more to absorb impact")
+        
+        # ── Entry speed ──
+        entry = metrics.get('entry_speed', 'moderate')
+        if entry == 'fast':
+            feedback.append("✅ Good entry speed")
+        elif entry == 'slow':
+            feedback.append("⚠️ Slow approach — more speed helps with height")
+        
+        # ── Takeoff lean ──
+        lean = metrics.get('takeoff_lean_deg', 0)
+        if lean > 20:
+            feedback.append(f"⚠️ Too much lean at takeoff ({lean:.0f}°) — stay more upright")
+        elif lean > 0 and lean < 15:
+            feedback.append(f"✅ Good takeoff posture ({lean:.0f}° lean)")
+    
+    elif element_type == 'spin':
+        # ── Speed ──
+        avg_rpm = metrics.get('avg_rpm', 0)
+        peak_rpm = metrics.get('peak_rpm', 0)
+        if avg_rpm >= 240:
+            feedback.append(f"✅ Fast spin at {avg_rpm:.0f} RPM")
+        elif avg_rpm >= 150:
+            feedback.append(f"Good spin speed at {avg_rpm:.0f} RPM")
+        else:
+            feedback.append(f"⚠️ Spin speed dropped to {avg_rpm:.0f} RPM — pull arms in")
+        
+        if peak_rpm > avg_rpm * 1.3 and peak_rpm > 200:
+            feedback.append(f"Peak speed: {peak_rpm:.0f} RPM")
+        
+        # ── Centering ──
+        centering = metrics.get('centering_px', 0)
+        if centering < 50:
+            feedback.append("✅ Well-centered spin")
+        elif centering < 100:
+            feedback.append("Decent centering — minor travel")
+        else:
+            feedback.append("⚠️ Spin traveling — try to stay centered over skating foot")
+        
+        # ── Speed profile ──
+        profile = metrics.get('speed_profile', 'steady')
+        if profile == 'accelerating':
+            feedback.append("✅ Good acceleration through the spin")
+        elif profile == 'decelerating':
+            feedback.append("⚠️ Speed drops off — try to maintain or increase speed")
+        else:
+            feedback.append("Steady speed throughout")
+        
+        # ── Position consistency ──
+        consistency = metrics.get('position_consistency', 0)
+        if consistency < 8:
+            feedback.append("✅ Stable position throughout")
+        elif consistency < 15:
+            feedback.append("Mostly stable position")
+        else:
+            feedback.append("⚠️ Position wavering — focus on holding the position")
+    
+    return feedback
+
+
 def detect_elements(frame_data, fps):
     """Detect jumps and spins from pose trajectory.
     
@@ -542,11 +887,27 @@ def detect_elements(frame_data, fps):
             continue
         
         jump_type = classify_jump(frame_data, start, apex_frame, end, rotations)
-        feedback = generate_jump_feedback(frame_data, start, apex_frame, end, height, rotations, jump_type, fps)
         score = calculate_jump_score(jump_type, rotations)
         
         air_time_s = air_frames / fps
         confidence = min(0.95, 0.6 + (height / 100) + (rotations * 0.1))
+        
+        # Calculate detailed metrics
+        jump_metrics = calculate_jump_metrics(frame_data, start, apex_frame, end, height, rotations, jump_type, fps)
+        
+        # Generate detailed coaching feedback from metrics
+        feedback = generate_jump_feedback(frame_data, start, apex_frame, end, height, rotations, jump_type, fps)
+        detailed_tips = generate_detailed_feedback('jump', jump_metrics)
+        # Merge: keep basic feedback first, then add detailed tips that aren't redundant
+        existing_text = ' '.join(feedback).lower()
+        for tip in detailed_tips:
+            tip_lower = tip.lower()
+            # Avoid duplicating the same concept
+            if ('height' in tip_lower and 'height' in existing_text):
+                continue
+            if ('knee' in tip_lower and 'knee' in existing_text):
+                continue
+            feedback.append(tip)
         
         print(f"[JUMP] ✅ {jump_type}: {rotations} rot (raw: {raw_rotations:.2f}, corrected: {corrected:.2f}), height={height:.0f}px, air={air_time_s:.2f}s, frames {start}-{end}")
         
@@ -560,6 +921,7 @@ def detect_elements(frame_data, fps):
             confidence=round(confidence, 2),
             score=score,
             feedback=feedback,
+            metrics=jump_metrics,
         ))
     
     # ── Spin Detection ───────────────────────────────────────────
@@ -612,16 +974,17 @@ def detect_elements(frame_data, fps):
                 avg_speed = np.mean(rotation_speeds[spin_start:i])
                 spin_pos = classify_spin_position(frame_data, spin_start, i)
                 
+                # Calculate detailed spin metrics
+                spin_metrics = calculate_spin_metrics(frame_data, spin_start, i, fps)
+                
                 spin_feedback = [
                     f"Detected: {spin_pos} Spin",
-                    f"{revolutions:.1f} revolutions at {avg_speed:.0f}°/s",
+                    f"{spin_metrics.get('revolutions', revolutions):.1f} revolutions at {spin_metrics.get('avg_rpm', 0):.0f} RPM",
                 ]
-                if revolutions >= 6:
-                    spin_feedback.append("✅ Great revolution count!")
-                if avg_speed > 300:
-                    spin_feedback.append("✅ Fast rotation speed")
-                elif avg_speed < 180:
-                    spin_feedback.append("⚠️ Try pulling arms in tighter for more speed")
+                
+                # Generate detailed coaching tips from metrics
+                detailed_spin_tips = generate_detailed_feedback('spin', spin_metrics)
+                spin_feedback.extend(detailed_spin_tips)
                 
                 spin_score = calculate_spin_score(spin_pos, revolutions, avg_speed)
                 
@@ -639,6 +1002,7 @@ def detect_elements(frame_data, fps):
                     confidence=round(confidence, 2),
                     score=round(spin_score, 2),
                     feedback=spin_feedback,
+                    metrics=spin_metrics,
                 ))
             else:
                 print(f"[SPIN] Rejected frames {spin_start}-{i}: too short ({duration_frames} frames, need {min_spin_duration:.0f})")
