@@ -82,6 +82,10 @@ class KeyframeData(BaseModel):
     keypoints: List[List[float]]  # [[x, y, confidence], ...] normalized 0-1
     box: List[float]  # [x1, y1, x2, y2] normalized 0-1
 
+class RotationPoint(BaseModel):
+    time_sec: float
+    velocity_dps: float  # degrees per second
+
 class AnalysisResult(BaseModel):
     success: bool
     total_frames: int
@@ -91,6 +95,7 @@ class AnalysisResult(BaseModel):
     session_feedback: List[str]
     poses: Optional[dict] = None
     keyframes: Optional[List[KeyframeData]] = None
+    rotation_velocity: Optional[List[RotationPoint]] = None
 
 
 # ── ONNX Inference Helpers ───────────────────────────────────────────
@@ -1628,6 +1633,30 @@ async def analyze_video(video: UploadFile = File(...)):
             total_score = sum(e.score for e in elements)
             session_feedback.append(f"Total elements: {len(elements)}, Combined score: {total_score:.1f}")
         
+        # Build rotation velocity timeseries (smoothed angular velocity per frame)
+        rot_velocity = []
+        orientations = [fd.get('orientation', 0) for fd in frame_data]
+        for i in range(1, len(orientations)):
+            diff = orientations[i] - orientations[i - 1]
+            while diff > 180: diff -= 360
+            while diff < -180: diff += 360
+            vel = abs(diff) * fps  # degrees per second
+            t = frame_data[i].get('time_ms', 0) / 1000.0
+            rot_velocity.append(RotationPoint(time_sec=round(t, 3), velocity_dps=round(vel, 1)))
+        
+        # Light smoothing (3-point moving average) to reduce noise
+        if len(rot_velocity) >= 3:
+            smoothed = []
+            vels = [p.velocity_dps for p in rot_velocity]
+            for i in range(len(vels)):
+                window = vels[max(0,i-1):i+2]
+                avg = sum(window) / len(window)
+                smoothed.append(RotationPoint(
+                    time_sec=rot_velocity[i].time_sec,
+                    velocity_dps=round(avg, 1)
+                ))
+            rot_velocity = smoothed
+        
         return AnalysisResult(
             success=True,
             total_frames=total_frames,
@@ -1640,6 +1669,7 @@ async def analyze_video(video: UploadFile = File(...)):
                 'engine': 'yolov8-pose-onnx',
             },
             keyframes=keyframes_list if keyframes_list else None,
+            rotation_velocity=rot_velocity if rot_velocity else None,
         )
     
     finally:
