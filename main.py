@@ -91,6 +91,8 @@ class AnalysisResult(BaseModel):
     total_frames: int
     fps: float
     duration_seconds: float
+    video_width: Optional[int] = None
+    video_height: Optional[int] = None
     elements: List[SkatingElement]
     session_feedback: List[str]
     poses: Optional[dict] = None
@@ -250,6 +252,8 @@ def extract_frame_data(video_path: str):
     
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    vid_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vid_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     duration = total_frames / fps if fps > 0 else 0
     
     # Process every frame for short clips (smooth skeleton overlay).
@@ -387,7 +391,7 @@ def extract_frame_data(video_path: str):
         frame_data = interpolate_frames(frame_data, total_frames, fps)
     
     print(f"[ANALYZE] Processed {len(frame_data)} frames (from {total_frames} total)")
-    return frame_data, fps, total_frames, duration
+    return frame_data, fps, total_frames, duration, vid_width, vid_height
 
 
 def interpolate_frames(sampled_data, total_frames, fps):
@@ -1596,7 +1600,7 @@ async def analyze_video(video: UploadFile = File(...)):
         gc.collect()
     
     try:
-        frame_data, fps, total_frames, duration = extract_frame_data(tmp_path)
+        frame_data, fps, total_frames, duration, vid_w, vid_h = extract_frame_data(tmp_path)
         poses_detected = sum(1 for fd in frame_data if fd['has_pose'])
         
         if poses_detected < 5:
@@ -1615,6 +1619,8 @@ async def analyze_video(video: UploadFile = File(...)):
                 total_frames=total_frames,
                 fps=fps,
                 duration_seconds=duration,
+                video_width=vid_w,
+                video_height=vid_h,
                 elements=[],
                 session_feedback=[
                     f"Only detected skater in {poses_detected}/{total_frames} frames.",
@@ -1703,6 +1709,8 @@ async def analyze_video(video: UploadFile = File(...)):
             total_frames=total_frames,
             fps=fps,
             duration_seconds=duration,
+            video_width=vid_w,
+            video_height=vid_h,
             elements=elements,
             session_feedback=session_feedback,
             poses={
