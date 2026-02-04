@@ -921,12 +921,12 @@ def count_rotation_robust(frame_data, start, end, fps):
     # ── Choose best rotation estimate ──
     # Use max across multiple methods and windows:
     # - Directed methods: filter L/R keypoint swap noise (best for fast rotation)
-    # - Original-window abs sum: accurate for slower rotation where noise ratio 
-    #   is high but swaps are rare in the shorter, cleaner airborne window
-    # Extended-window abs is excluded (overcounts due to approach/exit noise)
+    # Use ONLY directed methods — they filter L/R keypoint swap noise.
+    # simple_abs methods are excluded: they sum ALL angle changes including
+    # YOLO keypoint swap artifacts (~180° fake jumps), overcounting by 1-2 rotations
+    # on fast spins (e.g. triple toe loop measured as quad).
     candidates = [b_shoulder_directed, d_hip_directed, 
-                  f_orig_sh_directed, g_orig_hp_directed,
-                  simple_abs_orig]
+                  f_orig_sh_directed, g_orig_hp_directed]
     raw_rotation = max(candidates)
     
     debug = {
@@ -1252,8 +1252,10 @@ def classify_jump(frame_data, start, apex, end, rotations):
     
     # If half-rotation detected but NO forward entry → not an Axel.
     # Round to nearest integer instead (measurement noise caused the .5)
+    # Use int(x + 0.5) instead of round() to avoid Python banker's rounding
+    # (round(2.5) = 2 in Python, but we want 3 — benefit of the doubt for skater)
     if is_half_rotation and not forward_entry:
-        rotations = round(rotations)
+        rotations = int(rotations + 0.5)
         if rotations < 1: rotations = 1
         reasons.append(f"Half-rot {fractional:.1f} but backward entry → rounded to {rotations}")
     
