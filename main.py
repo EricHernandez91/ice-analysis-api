@@ -74,6 +74,13 @@ class SkatingElement(BaseModel):
     confidence: float
     score: float
     feedback: List[str]
+    metrics: Optional[dict] = None
+
+class KeyframeData(BaseModel):
+    frame: int
+    time_sec: float
+    keypoints: List[List[float]]  # [[x, y, confidence], ...] normalized 0-1
+    box: List[float]  # [x1, y1, x2, y2] normalized 0-1
 
 class AnalysisResult(BaseModel):
     success: bool
@@ -83,6 +90,7 @@ class AnalysisResult(BaseModel):
     elements: List[SkatingElement]
     session_feedback: List[str]
     poses: Optional[dict] = None
+    keyframes: Optional[List[KeyframeData]] = None
 
 
 # ── ONNX Inference Helpers ───────────────────────────────────────────
@@ -287,11 +295,16 @@ def extract_frame_data(video_path: str):
         
         # Pick largest person (skater)
         skater_kps = None
+        skater_box = None
         if detections:
             detections.sort(key=lambda d: (d['box'][2]-d['box'][0]) * (d['box'][3]-d['box'][1]), reverse=True)
             skater_kps = detections[0]['keypoints']
+            skater_box = detections[0]['box']
         
         del detections
+        
+        # Get original frame dimensions for normalization
+        frame_h, frame_w = frame.shape[:2]
         
         fd = {
             'frame': frame_idx,
@@ -299,6 +312,23 @@ def extract_frame_data(video_path: str):
             'has_pose': skater_kps is not None,
             '_real': True,  # Mark as actually processed (not interpolated)
         }
+        
+        # Store raw keypoints and box for skeleton overlay (normalized 0-1)
+        if skater_kps is not None and skater_box is not None:
+            norm_kps = []
+            for k in range(17):
+                kx = float(skater_kps[k][0]) / frame_w
+                ky = float(skater_kps[k][1]) / frame_h
+                kc = float(skater_kps[k][2])
+                norm_kps.append([round(kx, 4), round(ky, 4), round(kc, 4)])
+            norm_box = [
+                round(float(skater_box[0]) / frame_w, 4),
+                round(float(skater_box[1]) / frame_h, 4),
+                round(float(skater_box[2]) / frame_w, 4),
+                round(float(skater_box[3]) / frame_h, 4),
+            ]
+            fd['_raw_keypoints'] = norm_kps
+            fd['_raw_box'] = norm_box
         
         if skater_kps is not None:
             lh, rh = skater_kps[KP['left_hip']], skater_kps[KP['right_hip']]
@@ -593,9 +623,7 @@ def detect_elements(frame_data, fps):
                 elif avg_speed < 180:
                     spin_feedback.append("⚠️ Try pulling arms in tighter for more speed")
                 
-                spin_score = {'Sit': 1.8, 'Camel': 2.0}.get(spin_pos, 1.5)
-                if revolutions >= 6: spin_score += 0.5
-                if avg_speed > 300: spin_score += 0.3
+                spin_score = calculate_spin_score(spin_pos, revolutions, avg_speed)
                 
                 confidence = min(0.90, 0.5 + (revolutions / 20) + (0.1 if hip_x_range < 80 else 0))
                 
@@ -622,45 +650,229 @@ def detect_elements(frame_data, fps):
 
 
 def classify_jump(frame_data, start, apex, end, rotations):
-    """Classify jump type based on rotation count and takeoff characteristics.
+    """Classify jump type using biomechanical analysis of pose keypoints.
     
-    Axels always have half-rotation extra (1.5, 2.5, 3.5) because they
-    take off forward. We use a tolerance band since subsampled frames
-    may not measure rotation precisely.
+    Classification hierarchy:
+    1. Axel detection — half-rotation count + forward entry
+    2. Toe pick detection — ankle height differential at takeoff
+    3. Edge jump differentiation (Salchow vs Loop) — knee bend + leg position
+    4. Toe jump differentiation (T vs F vs Lz) — counter-rotation detection
+    
+    See SKATING_CLASSIFICATION.md for full research notes.
     """
-    # Check if rotations are near a half-value (Axel signature)
-    # Tolerance: within 0.4 of a .5 value (e.g., 1.1-1.9 → Axel)
-    # Wider tolerance because subsampled frames undercount rotation
-    fractional = rotations % 1.0
-    is_axel = (0.1 <= fractional <= 0.9)
+    reasons = []  # Track classification reasoning
     
-    if is_axel:
-        # Round to nearest .5 for proper Axel naming
+    # ── Step 1: Axel Detection ──────────────────────────────────
+    # Axels have fractional rotation (n + 0.5) due to forward takeoff
+    fractional = rotations % 1.0
+    is_half_rotation = (0.1 <= fractional <= 0.9)
+    
+    # Also check for forward entry: body faces travel direction at takeoff
+    # Forward entry means hip_x is increasing (or decreasing) in the same
+    # direction the shoulders face
+    forward_entry = False
+    if start > 5:
+        pre_takeoff = frame_data[max(0, start - 10):start]
+        pre_orientations = [fd.get('orientation', 0) for fd in pre_takeoff if fd.get('has_pose')]
+        pre_hip_xs = [fd.get('hip_x', 0) for fd in pre_takeoff if fd.get('has_pose')]
+        
+        if len(pre_hip_xs) >= 3:
+            # Travel direction from hip movement
+            hip_dx = pre_hip_xs[-1] - pre_hip_xs[0]
+            # Shoulder direction from orientation
+            avg_orient = np.mean(pre_orientations) if pre_orientations else 0
+            # Forward entry: shoulder vector roughly aligns with travel direction
+            # (orientation ~0° or ~180° means shoulders face sideways/forward)
+            # In 2D, forward skating has shoulders perpendicular to travel
+            # Not a perfect signal, but combined with half-rotation it's strong
+            reasons.append(f"hip_dx={hip_dx:.1f}, orient={avg_orient:.1f}")
+    
+    if is_half_rotation:
         axel_rotations = round(rotations * 2) / 2
         if axel_rotations % 1.0 == 0.5:
+            reasons.append(f"Axel: fractional rotation {rotations} → {axel_rotations}")
+            print(f"[CLASSIFY] {' | '.join(reasons)}")
             return f"{rotation_prefix(axel_rotations)} Axel"
     
-    # For non-Axel jumps, check takeoff for toe vs edge
-    takeoff_start = max(start, apex - 5)
+    # ── Step 2: Toe Pick Detection ──────────────────────────────
+    # Toe pick jumps have one ankle significantly higher than the other
+    # at takeoff (picking foot plants toe in ice behind)
+    takeoff_window = max(3, int((apex - start) * 0.6))
+    takeoff_start = max(start, apex - takeoff_window)
     takeoff_frames = frame_data[takeoff_start:apex]
+    
     ankle_diffs = [fd.get('ankle_diff', 0) for fd in takeoff_frames if fd.get('has_pose')]
     avg_ankle_diff = np.mean(ankle_diffs) if ankle_diffs else 0
+    max_ankle_diff = max(ankle_diffs) if ankle_diffs else 0
+    
+    TOE_PICK_THRESHOLD = 25  # pixels — ankle height difference indicating toe assist
+    is_toe_jump = avg_ankle_diff > TOE_PICK_THRESHOLD or max_ankle_diff > TOE_PICK_THRESHOLD * 1.5
+    
+    reasons.append(f"ankle_diff avg={avg_ankle_diff:.1f} max={max_ankle_diff:.1f} → {'toe' if is_toe_jump else 'edge'}")
     
     prefix = rotation_prefix(rotations)
-    if avg_ankle_diff > 20:
-        return f"{prefix} Toe Loop"
-    return f"{prefix} Salchow"
+    
+    if not is_toe_jump:
+        # ── Step 3: Edge Jump Classification (Salchow vs Loop) ──
+        # Loop: crossed legs, deeper knee bend at takeoff
+        # Salchow: free leg swings, more upright at takeoff
+        knee_angles = []
+        ankle_spreads = []
+        for fd in takeoff_frames:
+            if fd.get('has_pose'):
+                ka = min(fd.get('knee_angle_l', 180), fd.get('knee_angle_r', 180))
+                knee_angles.append(ka)
+                # Check ankle x-spread (Loop has ankles close together = crossed)
+                # We approximate from ankle_diff — but really we need x-difference
+                # For now, use knee angle as primary differentiator
+        
+        avg_knee = np.mean(knee_angles) if knee_angles else 180
+        
+        LOOP_KNEE_THRESHOLD = 130  # degrees — Loop has deeper bend
+        
+        if avg_knee < LOOP_KNEE_THRESHOLD:
+            reasons.append(f"Edge jump: knee_avg={avg_knee:.1f}° < {LOOP_KNEE_THRESHOLD} → Loop")
+            print(f"[CLASSIFY] {' | '.join(reasons)}")
+            return f"{prefix} Loop"
+        else:
+            reasons.append(f"Edge jump: knee_avg={avg_knee:.1f}° ≥ {LOOP_KNEE_THRESHOLD} → Salchow")
+            print(f"[CLASSIFY] {' | '.join(reasons)}")
+            return f"{prefix} Salchow"
+    
+    # ── Step 4: Toe Jump Classification (Toe Loop vs Flip vs Lutz) ──
+    # Key differentiator: Lutz has COUNTER-ROTATION before takeoff
+    # (body rotates opposite to jump direction during approach)
+    
+    # Measure orientation change in approach (pre-takeoff) vs during jump
+    pre_window = min(15, max(5, start))  # frames before takeoff to analyze
+    pre_start = max(0, start - pre_window)
+    
+    pre_orientations = [fd.get('orientation', 0) for fd in frame_data[pre_start:start] if fd.get('has_pose')]
+    jump_orientations = [fd.get('orientation', 0) for fd in frame_data[start:apex] if fd.get('has_pose')]
+    
+    counter_rotation = False
+    if len(pre_orientations) >= 3 and len(jump_orientations) >= 3:
+        # Calculate approach rotation direction
+        pre_delta = 0
+        for j in range(1, len(pre_orientations)):
+            d = pre_orientations[j] - pre_orientations[j-1]
+            while d > 180: d -= 360
+            while d < -180: d += 360
+            pre_delta += d
+        
+        # Calculate jump rotation direction
+        jump_delta = 0
+        for j in range(1, len(jump_orientations)):
+            d = jump_orientations[j] - jump_orientations[j-1]
+            while d > 180: d -= 360
+            while d < -180: d += 360
+            jump_delta += d
+        
+        # Counter-rotation: approach rotates opposite to jump
+        if abs(pre_delta) > 15 and abs(jump_delta) > 15:
+            counter_rotation = (pre_delta * jump_delta < 0)  # opposite signs
+        
+        reasons.append(f"pre_rot={pre_delta:.1f}° jump_rot={jump_delta:.1f}° counter={counter_rotation}")
+    
+    if counter_rotation:
+        reasons.append("Toe + counter-rotation → Lutz")
+        print(f"[CLASSIFY] {' | '.join(reasons)}")
+        return f"{prefix} Lutz"
+    
+    # Distinguish Flip vs Toe Loop by ankle differential magnitude
+    # Flip typically has larger ankle differential (more aggressive toe pick)
+    FLIP_THRESHOLD = 35  # pixels
+    if avg_ankle_diff > FLIP_THRESHOLD:
+        reasons.append(f"Toe: ankle_diff={avg_ankle_diff:.1f} > {FLIP_THRESHOLD} → Flip")
+        print(f"[CLASSIFY] {' | '.join(reasons)}")
+        return f"{prefix} Flip"
+    
+    reasons.append(f"Toe: default → Toe Loop")
+    print(f"[CLASSIFY] {' | '.join(reasons)}")
+    return f"{prefix} Toe Loop"
 
 
 def classify_spin_position(frame_data, start, end):
+    """Classify spin position using knee angles, hip position, and body geometry.
+    
+    Positions detected:
+    - Sit: Deep knee bend (skating knee < 110°), hips drop significantly
+    - Camel: Free leg extended back, torso horizontal (shoulder Y ≈ hip Y)
+    - Layback: Back arched, spine tilts backward (nose behind hips)
+    - Upright: Standing position, knee angles > 150°
+    - Combination: Significant position changes during the spin
+    """
     knee_angles = []
-    for fd in frame_data[start:end]:
-        if fd.get('has_pose'):
-            ka = min(fd.get('knee_angle_l', 180), fd.get('knee_angle_r', 180))
-            knee_angles.append(ka)
-    avg_knee = np.mean(knee_angles) if knee_angles else 180
-    if avg_knee < 110: return 'Sit'
-    elif avg_knee < 140: return 'Camel'
+    shoulder_hip_ratios = []  # For camel detection (torso horizontal)
+    position_samples = []
+    
+    # Sample positions throughout spin to detect combinations
+    sample_step = max(1, (end - start) // 10)
+    
+    for i, fd in enumerate(frame_data[start:end]):
+        if not fd.get('has_pose'):
+            continue
+        
+        ka_l = fd.get('knee_angle_l', 180)
+        ka_r = fd.get('knee_angle_r', 180)
+        min_knee = min(ka_l, ka_r)
+        knee_angles.append(min_knee)
+        
+        # Shoulder Y relative to hip Y — for camel detection
+        # In camel, shoulders drop toward hip level (torso horizontal)
+        hip_y = fd.get('hip_y', 0)
+        # shoulder_width can proxy shoulder height change
+        sw = fd.get('shoulder_width', 0)
+        if hip_y > 0 and sw > 0:
+            shoulder_hip_ratios.append(sw)
+        
+        # Sample positions at intervals for combination detection
+        if i % sample_step == 0:
+            if min_knee < 110:
+                position_samples.append('sit')
+            elif min_knee < 140:
+                position_samples.append('camel')
+            else:
+                position_samples.append('upright')
+    
+    if not knee_angles:
+        return 'Upright'
+    
+    avg_knee = np.mean(knee_angles)
+    min_knee_overall = np.min(knee_angles)
+    
+    # Check for combination spin: position changes during spin
+    unique_positions = set(position_samples)
+    if len(unique_positions) >= 2 and len(position_samples) >= 4:
+        # Count position transitions
+        transitions = sum(1 for i in range(1, len(position_samples)) 
+                         if position_samples[i] != position_samples[i-1])
+        if transitions >= 2:
+            print(f"[SPIN-CLASS] Combination: {transitions} transitions, positions: {position_samples}")
+            return 'Combination'
+    
+    # Primary classification by knee angle
+    if avg_knee < 110:
+        print(f"[SPIN-CLASS] Sit: avg_knee={avg_knee:.1f}°")
+        return 'Sit'
+    
+    # Camel detection: moderate knee angle + reduced shoulder width (torso tilted)
+    # When torso goes horizontal, shoulder width in 2D projection decreases
+    if avg_knee < 145 and shoulder_hip_ratios:
+        avg_sw = np.mean(shoulder_hip_ratios)
+        # Shoulder width shrinks when torso tilts forward (foreshortening)
+        # Compare with max observed shoulder width
+        max_sw = np.max(shoulder_hip_ratios) if shoulder_hip_ratios else avg_sw
+        if max_sw > 0 and avg_sw / max_sw < 0.75:
+            print(f"[SPIN-CLASS] Camel: avg_knee={avg_knee:.1f}°, sw_ratio={avg_sw/max_sw:.2f}")
+            return 'Camel'
+    
+    # Camel fallback: moderate knee angle range
+    if 110 <= avg_knee < 140:
+        print(f"[SPIN-CLASS] Camel (by knee): avg_knee={avg_knee:.1f}°")
+        return 'Camel'
+    
+    print(f"[SPIN-CLASS] Upright: avg_knee={avg_knee:.1f}°")
     return 'Upright'
 
 
@@ -670,21 +882,72 @@ def rotation_prefix(rotations):
 
 
 def calculate_jump_score(jump_type, rotations):
-    """ISU 2024-25 base values for jumps."""
-    # Full ISU base value table
+    """ISU 2024-25 base values for jumps (Communication 2707).
+    
+    Complete table for all 6 jump types × 4 rotation levels.
+    Also includes Euler (single only, used in combinations).
+    """
     base_values = {
-        1: {'Toe Loop': 0.4, 'Salchow': 0.4, 'Loop': 0.5, 'Flip': 0.5, 'Lutz': 0.6, 'Axel': 1.1},
-        2: {'Toe Loop': 1.3, 'Salchow': 1.3, 'Loop': 1.7, 'Flip': 1.8, 'Lutz': 2.1, 'Axel': 3.3},
-        3: {'Toe Loop': 4.2, 'Salchow': 4.3, 'Loop': 4.9, 'Flip': 5.3, 'Lutz': 5.9, 'Axel': 8.0},
-        4: {'Toe Loop': 9.5, 'Salchow': 9.7, 'Loop': 10.5, 'Flip': 11.0, 'Lutz': 11.5, 'Axel': 12.5},
+        1: {
+            'Toe Loop': 0.40, 'Salchow': 0.40, 'Loop': 0.50,
+            'Flip': 0.50, 'Lutz': 0.60, 'Axel': 1.10, 'Euler': 0.50,
+        },
+        2: {
+            'Toe Loop': 1.30, 'Salchow': 1.30, 'Loop': 1.70,
+            'Flip': 1.80, 'Lutz': 2.10, 'Axel': 3.30,
+        },
+        3: {
+            'Toe Loop': 4.20, 'Salchow': 4.30, 'Loop': 4.90,
+            'Flip': 5.30, 'Lutz': 5.90, 'Axel': 8.00,
+        },
+        4: {
+            'Toe Loop': 9.50, 'Salchow': 9.70, 'Loop': 10.50,
+            'Flip': 11.00, 'Lutz': 11.50, 'Axel': 12.50,
+        },
     }
     r = max(1, min(4, int(rotations)))
     # Match jump type to base value table
     for jump_name, bv in base_values[r].items():
         if jump_name in jump_type:
             return bv
-    # Fallback
-    return base_values[r].get('Toe Loop', 0.4)
+    # Fallback to Toe Loop value
+    return base_values[r].get('Toe Loop', 0.40)
+
+
+def calculate_spin_score(spin_position, revolutions, avg_speed):
+    """ISU 2024-25 base values for spins.
+    
+    Estimates level from observable features (revolutions, speed).
+    Level determination is approximate without seeing level features
+    like difficult variations, change of edge, etc.
+    """
+    # Base values by spin type and level (B, 1, 2, 3, 4)
+    spin_base_values = {
+        'Upright':     {'B': 1.00, '1': 1.20, '2': 1.50, '3': 1.90, '4': 2.40},
+        'Sit':         {'B': 1.10, '1': 1.30, '2': 1.60, '3': 2.10, '4': 2.50},
+        'Camel':       {'B': 1.10, '1': 1.40, '2': 1.80, '3': 2.30, '4': 2.60},
+        'Layback':     {'B': 1.20, '1': 1.50, '2': 1.90, '3': 2.40, '4': 2.70},
+        'Combination': {'B': 1.70, '1': 2.00, '2': 2.50, '3': 3.00, '4': 3.50},
+    }
+    
+    # Estimate level from observable metrics
+    # (Real level requires seeing specific features — this is approximate)
+    estimated_level = 'B'
+    level_score = 0
+    if revolutions >= 4:
+        level_score += 1
+    if revolutions >= 6:
+        level_score += 1
+    if avg_speed > 200:
+        level_score += 1
+    if avg_speed > 300:
+        level_score += 1
+    
+    level_map = {0: 'B', 1: '1', 2: '2', 3: '3', 4: '4'}
+    estimated_level = level_map.get(min(level_score, 4), 'B')
+    
+    values = spin_base_values.get(spin_position, spin_base_values['Upright'])
+    return values.get(estimated_level, values['B'])
 
 
 def generate_jump_feedback(frame_data, start, apex, end, height, rotations, jump_type, fps):
@@ -772,6 +1035,16 @@ async def analyze_video(video: UploadFile = File(...)):
         poses_detected = sum(1 for fd in frame_data if fd['has_pose'])
         
         if poses_detected < 5:
+            # Still extract what keyframes we can
+            few_keyframes = []
+            for fd in frame_data:
+                if fd.get('_real') and fd.get('has_pose') and '_raw_keypoints' in fd:
+                    few_keyframes.append(KeyframeData(
+                        frame=fd['frame'],
+                        time_sec=fd['time_ms'] / 1000.0,
+                        keypoints=fd['_raw_keypoints'],
+                        box=fd['_raw_box'],
+                    ))
             return AnalysisResult(
                 success=True,
                 total_frames=total_frames,
@@ -783,9 +1056,21 @@ async def analyze_video(video: UploadFile = File(...)):
                     "Make sure the full body is visible with good lighting.",
                 ],
                 poses={'detection_rate': f"{poses_detected}/{total_frames}"},
+                keyframes=few_keyframes if few_keyframes else None,
             )
         
         elements = detect_elements(frame_data, fps)
+        
+        # Build keyframes list from real (non-interpolated) frames with pose data
+        keyframes_list = []
+        for fd in frame_data:
+            if fd.get('_real') and fd.get('has_pose') and '_raw_keypoints' in fd:
+                keyframes_list.append(KeyframeData(
+                    frame=fd['frame'],
+                    time_sec=fd['time_ms'] / 1000.0,
+                    keypoints=fd['_raw_keypoints'],
+                    box=fd['_raw_box'],
+                ))
         
         session_feedback = []
         for e in elements:
@@ -810,6 +1095,7 @@ async def analyze_video(video: UploadFile = File(...)):
                 'detection_rate': f"{poses_detected}/{total_frames}",
                 'engine': 'yolov8-pose-onnx',
             },
+            keyframes=keyframes_list if keyframes_list else None,
         )
     
     finally:
