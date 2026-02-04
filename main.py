@@ -239,10 +239,16 @@ def extract_frame_data(video_path: str):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if fps > 0 else 0
     
-    # Process every frame on paid tier for maximum accuracy
-    # (Subsample only for very long videos to keep response time reasonable)
-    target_frames = 60
+    # Smart subsampling: process enough frames for accurate detection
+    # but stay fast enough to respond within Render's timeout.
+    # For skating, 20-25 frames is plenty for jump/spin detection.
+    # More frames = marginally better but much slower.
+    target_frames = 25
     step = max(1, total_frames // target_frames)
+    
+    # Also cap video duration — reject videos over 60 seconds
+    if duration > 60:
+        raise HTTPException(status_code=400, detail=f"Video too long ({duration:.0f}s). Please upload clips under 60 seconds.")
     
     print(f"[ANALYZE] {total_frames} frames @ {fps:.1f}fps, step={step}, ~{total_frames//step} will be processed")
     
@@ -260,6 +266,12 @@ def extract_frame_data(video_path: str):
         if frame_idx % step != 0:
             frame_idx += 1
             continue
+        
+        # Downscale large frames before ONNX preprocessing to save memory
+        h, w = frame.shape[:2]
+        if max(h, w) > 1080:
+            downscale = 1080 / max(h, w)
+            frame = cv2.resize(frame, (int(w * downscale), int(h * downscale)))
         
         # Preprocess (model requires 640x640 fixed input)
         blob, scale, pad = preprocess_frame(frame, input_size=640)
