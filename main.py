@@ -1180,36 +1180,57 @@ def classify_jump(frame_data, start, apex, end, rotations):
     reasons = []  # Track classification reasoning
     
     # ── Step 1: Axel Detection ──────────────────────────────────
-    # Axels have fractional rotation (n + 0.5) due to forward takeoff
+    # Axels are the ONLY jump with forward takeoff (skater faces travel direction).
+    # They have fractional rotation (n + 0.5) due to this forward entry.
+    # BOTH conditions must be met: half-rotation AND forward entry evidence.
     fractional = rotations % 1.0
     is_half_rotation = (0.1 <= fractional <= 0.9)
     
-    # Also check for forward entry: body faces travel direction at takeoff
-    # Forward entry means hip_x is increasing (or decreasing) in the same
-    # direction the shoulders face
+    # Check for forward entry: nose/body faces the travel direction at takeoff
+    # For backward jumps (all others), the skater's back faces travel direction
     forward_entry = False
-    if start > 5:
-        pre_takeoff = frame_data[max(0, start - 10):start]
-        pre_orientations = [fd.get('orientation', 0) for fd in pre_takeoff if fd.get('has_pose')]
+    forward_score = 0  # Confidence in forward entry (0-1)
+    
+    if start > 3:
+        pre_takeoff = frame_data[max(0, start - 15):start]
         pre_hip_xs = [fd.get('hip_x', 0) for fd in pre_takeoff if fd.get('has_pose')]
+        pre_nose_offsets = [fd.get('nose_offset_x', 0) for fd in pre_takeoff if fd.get('has_pose') and fd.get('nose_offset_x') is not None]
         
         if len(pre_hip_xs) >= 3:
             # Travel direction from hip movement
             hip_dx = pre_hip_xs[-1] - pre_hip_xs[0]
-            # Shoulder direction from orientation
-            avg_orient = np.mean(pre_orientations) if pre_orientations else 0
-            # Forward entry: shoulder vector roughly aligns with travel direction
-            # (orientation ~0° or ~180° means shoulders face sideways/forward)
-            # In 2D, forward skating has shoulders perpendicular to travel
-            # Not a perfect signal, but combined with half-rotation it's strong
-            reasons.append(f"hip_dx={hip_dx:.1f}, orient={avg_orient:.1f}")
+            travel_dir = 1 if hip_dx > 0 else -1  # +1 = moving right, -1 = moving left
+            
+            # Forward entry check: nose is AHEAD of hips in travel direction
+            # For forward skating, nose_offset_x has same sign as travel direction
+            # For backward skating, nose is BEHIND (opposite sign or near zero)
+            if pre_nose_offsets and abs(hip_dx) > 5:
+                avg_nose_offset = np.mean(pre_nose_offsets)
+                nose_ahead = (avg_nose_offset * travel_dir) > 0
+                nose_magnitude = abs(avg_nose_offset)
+                
+                # Strong forward signal: nose clearly ahead of hips in travel direction
+                if nose_ahead and nose_magnitude > 3:
+                    forward_score = min(1.0, nose_magnitude / 20)
+                    forward_entry = forward_score > 0.2
+                
+                reasons.append(f"hip_dx={hip_dx:.1f}, nose_offset={avg_nose_offset:.1f}, fwd_score={forward_score:.2f}")
+            else:
+                reasons.append(f"hip_dx={hip_dx:.1f}, no nose data")
     
-    if is_half_rotation:
+    # Axel requires BOTH half-rotation AND forward entry evidence
+    if is_half_rotation and forward_entry:
         axel_rotations = round(rotations * 2) / 2
         if axel_rotations % 1.0 == 0.5:
-            reasons.append(f"Axel: fractional rotation {rotations} → {axel_rotations}")
+            reasons.append(f"Axel: half-rot + forward entry → {axel_rotations}")
             print(f"[CLASSIFY] {' | '.join(reasons)}")
             return f"{rotation_prefix(axel_rotations)} Axel"
+    
+    # If half-rotation detected but NO forward entry → not an Axel.
+    # Round to nearest integer instead (measurement noise caused the .5)
+    if is_half_rotation and not forward_entry:
+        rotations = round(rotations)
+        reasons.append(f"Half-rot {fractional:.1f} but backward entry → rounded to {rotations}")
     
     # ── Step 2: Toe Pick Detection ──────────────────────────────
     # Toe pick jumps have one ankle significantly higher than the other
