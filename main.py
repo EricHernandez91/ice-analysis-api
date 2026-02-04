@@ -871,7 +871,7 @@ def count_rotation_robust(frame_data, start, end, fps):
                 crossings += 1
         return crossings / 2.0
     
-    # ── Compute all methods ──
+    # ── Compute all methods over EXTENDED window (±3 frames) ──
     sh_diffs = compute_angle_diffs(shoulder_angles)
     hp_diffs = compute_angle_diffs(hip_angles)
     
@@ -880,29 +880,57 @@ def count_rotation_robust(frame_data, start, end, fps):
     c_hip_cleaned = method_cleaned(hp_diffs)
     d_hip_directed = method_directed(hp_diffs)
     e_oscillation = method_oscillation(shoulder_widths)
+    simple_abs_ext = sum(abs(d) for d in sh_diffs) / 360
     
-    # Also compute the old simple abs-sum for comparison
-    simple_abs = sum(abs(d) for d in sh_diffs) / 360
+    # ── Also compute over ORIGINAL window (no extension) ──
+    # The extended window can capture approach/exit counter-rotation that
+    # confuses the directed method. Original window = pure airborne phase.
+    orig_sh_angles = []
+    orig_hp_angles = []
+    for fd in frame_data[start:end + 1]:
+        if fd.get('_real', True) and fd.get('has_pose'):
+            orig_sh_angles.append(fd.get('orientation', 0))
+            orig_hp_angles.append(fd.get('hip_orientation', fd.get('orientation', 0)))
     
-    # Take the maximum of all methods (undercounting is the dominant error)
-    raw_rotation = max(a_shoulder_cleaned, b_shoulder_directed, 
-                       c_hip_cleaned, d_hip_directed, e_oscillation)
+    if len(orig_sh_angles) >= 3:
+        orig_sh_diffs = compute_angle_diffs(orig_sh_angles)
+        orig_hp_diffs = compute_angle_diffs(orig_hp_angles)
+        f_orig_sh_directed = method_directed(orig_sh_diffs)
+        g_orig_hp_directed = method_directed(orig_hp_diffs)
+        simple_abs_orig = sum(abs(d) for d in orig_sh_diffs) / 360
+    else:
+        f_orig_sh_directed = 0
+        g_orig_hp_directed = 0
+        simple_abs_orig = 0
+    
+    # ── Choose best rotation estimate ──
+    # Use max across multiple methods and windows:
+    # - Directed methods: filter L/R keypoint swap noise (best for fast rotation)
+    # - Original-window abs sum: accurate for slower rotation where noise ratio 
+    #   is high but swaps are rare in the shorter, cleaner airborne window
+    # Extended-window abs is excluded (overcounts due to approach/exit noise)
+    candidates = [b_shoulder_directed, d_hip_directed, 
+                  f_orig_sh_directed, g_orig_hp_directed,
+                  simple_abs_orig]
+    raw_rotation = max(candidates)
     
     debug = {
-        'simple_abs': round(simple_abs, 2),
-        'shoulder_cleaned': round(a_shoulder_cleaned, 2),
-        'shoulder_directed': round(b_shoulder_directed, 2),
-        'hip_cleaned': round(c_hip_cleaned, 2),
-        'hip_directed': round(d_hip_directed, 2),
+        'simple_abs_ext': round(simple_abs_ext, 2),
+        'simple_abs_orig': round(simple_abs_orig, 2),
+        'ext_sh_dir': round(b_shoulder_directed, 2),
+        'ext_hip_dir': round(d_hip_directed, 2),
+        'orig_sh_dir': round(f_orig_sh_directed, 2),
+        'orig_hip_dir': round(g_orig_hp_directed, 2),
         'oscillation': round(e_oscillation, 2),
         'chosen_raw': round(raw_rotation, 2),
-        'num_frames': len(shoulder_angles),
-        'median_sh_diff': round(float(np.median(sh_diffs)), 1) if sh_diffs else 0,
+        'num_frames_ext': len(shoulder_angles),
+        'num_frames_orig': len(orig_sh_angles),
     }
     
-    print(f"[ROT] simple={simple_abs:.2f} | sh_clean={a_shoulder_cleaned:.2f} sh_dir={b_shoulder_directed:.2f} | "
-          f"hip_clean={c_hip_cleaned:.2f} hip_dir={d_hip_directed:.2f} | osc={e_oscillation:.2f} → raw={raw_rotation:.2f} "
-          f"({len(shoulder_angles)} frames)")
+    print(f"[ROT] ext[sh_dir={b_shoulder_directed:.2f} hip_dir={d_hip_directed:.2f}] "
+          f"orig[sh_dir={f_orig_sh_directed:.2f} hip_dir={g_orig_hp_directed:.2f}] "
+          f"abs_ext={simple_abs_ext:.2f} abs_orig={simple_abs_orig:.2f} → "
+          f"raw={raw_rotation:.2f} ({len(shoulder_angles)}/{len(orig_sh_angles)} frames)")
     
     return raw_rotation, debug
 
@@ -992,12 +1020,12 @@ def detect_elements(frame_data, fps):
             continue
         
         # Count rotation using robust multi-method approach
+        # Extended ±3 frame window captures takeoff/landing rotation;
+        # directed method filters noise → no correction factor needed.
         raw_rotations, rot_debug = count_rotation_robust(frame_data, start, end, fps)
         
-        # Apply calibration correction (pose tracking undercounts ~15% due to
-        # keypoint noise during fast rotation, especially at tuck phase)
-        corrected = raw_rotations * 1.15
-        rotations = round(corrected * 2) / 2
+        # Round to nearest half rotation (for Axel detection)
+        rotations = round(raw_rotations * 2) / 2
         
         # Filter: must have at least 0.5 rotations to be a real jump
         if rotations < 0.5:
@@ -1027,7 +1055,7 @@ def detect_elements(frame_data, fps):
                 continue
             feedback.append(tip)
         
-        print(f"[JUMP] ✅ {jump_type}: {rotations} rot (raw: {raw_rotations:.2f}, corrected: {corrected:.2f}), "
+        print(f"[JUMP] ✅ {jump_type}: {rotations} rot (raw: {raw_rotations:.2f}), "
               f"height={height:.0f}px, air={air_time_s:.2f}s, frames {start}-{end}, rot_debug={rot_debug}")
         
         elements.append(SkatingElement(
