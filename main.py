@@ -1189,8 +1189,13 @@ def classify_jump(frame_data, start, apex, end, rotations):
     # Axels are the ONLY jump with forward takeoff (skater faces travel direction).
     # They have fractional rotation (n + 0.5) due to this forward entry.
     # BOTH conditions must be met: half-rotation AND forward entry evidence.
+    # Widen the "half rotation" tolerance — 2D measurement noise of ±0.3 is common.
+    # A measured 1.0 could really be 1.5 (Axel) if forward entry is strong.
     fractional = rotations % 1.0
     is_half_rotation = (0.1 <= fractional <= 0.9)
+    # "Borderline integer" — close enough to .0 that it COULD be a half-rotation
+    # if forward entry is very strong (rotation was undercounted by ~0.5)
+    is_borderline_integer = (fractional < 0.1 or fractional > 0.9)
     
     # Check for forward entry: nose/body faces the travel direction at takeoff
     # For backward jumps (all others), the skater's back faces travel direction
@@ -1231,6 +1236,15 @@ def classify_jump(frame_data, start, apex, end, rotations):
             reasons.append(f"Axel: half-rot + forward entry → {axel_rotations}")
             print(f"[CLASSIFY] {' | '.join(reasons)}")
             return f"{rotation_prefix(axel_rotations)} Axel", axel_rotations
+    
+    # Fallback: borderline integer rotation + STRONG forward entry → still Axel
+    # This catches cases where 2D measurement undercounted by ~0.5 rotation
+    # (e.g., measured 1.0 but was really 1.5 single Axel)
+    if is_borderline_integer and forward_entry and forward_score >= 0.4:
+        axel_rotations = round(rotations) + 0.5
+        reasons.append(f"Borderline Axel: rot={rotations:.2f} but strong fwd entry (score={forward_score:.2f}) → {axel_rotations}")
+        print(f"[CLASSIFY] {' | '.join(reasons)}")
+        return f"{rotation_prefix(axel_rotations)} Axel", axel_rotations
     
     # If half-rotation detected but NO forward entry → not an Axel.
     # Round to nearest integer instead (measurement noise caused the .5)
