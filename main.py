@@ -1571,7 +1571,7 @@ async def root():
     }
 
 
-BUILD_HASH = "b2a61cd-fix2"  # Update with each deploy to verify Render version
+BUILD_HASH = "d117bfe-fix3"  # Update with each deploy to verify Render version
 
 @app.get("/health")
 async def health():
