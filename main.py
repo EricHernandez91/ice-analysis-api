@@ -1634,22 +1634,47 @@ async def analyze_video(video: UploadFile = File(...)):
             session_feedback.append(f"Total elements: {len(elements)}, Combined score: {total_score:.1f}")
         
         # Build rotation velocity timeseries (smoothed angular velocity per frame)
+        # Use median-cleaned orientation to suppress YOLO keypoint swap artifacts:
+        # When left/right shoulders swap during fast rotation, orientation jumps ~180°
+        # which creates fake velocity spikes of 5000+°/s. Cap frame-to-frame diff
+        # and use 5-point median smoothing to remove these outliers.
         rot_velocity = []
         orientations = [fd.get('orientation', 0) for fd in frame_data]
+        
+        # Step 1: Compute raw frame-to-frame angular diffs
+        raw_diffs = []
         for i in range(1, len(orientations)):
             diff = orientations[i] - orientations[i - 1]
             while diff > 180: diff -= 360
             while diff < -180: diff += 360
-            vel = abs(diff) * fps  # degrees per second
-            t = frame_data[i].get('time_ms', 0) / 1000.0
+            raw_diffs.append(diff)
+        
+        # Step 2: Median-filter the diffs to kill swap spikes (5-frame window)
+        filtered_diffs = list(raw_diffs)
+        if len(raw_diffs) >= 5:
+            for i in range(len(raw_diffs)):
+                window = raw_diffs[max(0, i-2):i+3]
+                filtered_diffs[i] = float(np.median(window))
+        
+        # Step 3: Cap maximum plausible rotation speed
+        # World-class triple axel peaks ~1800-2200°/s
+        # Cap at ~100° per frame at 30fps = 3000°/s (generous upper bound)
+        MAX_DEG_PER_FRAME = 100
+        for i in range(len(filtered_diffs)):
+            if abs(filtered_diffs[i]) > MAX_DEG_PER_FRAME:
+                filtered_diffs[i] = MAX_DEG_PER_FRAME * (1 if filtered_diffs[i] > 0 else -1)
+        
+        for i in range(len(filtered_diffs)):
+            vel = abs(filtered_diffs[i]) * fps  # degrees per second
+            t = frame_data[i + 1].get('time_ms', 0) / 1000.0
             rot_velocity.append(RotationPoint(time_sec=round(t, 3), velocity_dps=round(vel, 1)))
         
-        # Light smoothing (3-point moving average) to reduce noise
+        # Step 4: 3-point moving average for visual smoothness
         if len(rot_velocity) >= 3:
             smoothed = []
             vels = [p.velocity_dps for p in rot_velocity]
             for i in range(len(vels)):
-                window = vels[max(0,i-1):i+2]
+                window = vels[max(0, i-1):i+2]
                 avg = sum(window) / len(window)
                 smoothed.append(RotationPoint(
                     time_sec=rot_velocity[i].time_sec,
