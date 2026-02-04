@@ -1565,9 +1565,11 @@ async def root():
     }
 
 
+BUILD_HASH = "b2a61cd-fix2"  # Update with each deploy to verify Render version
+
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "engine": "yolov8-pose-onnx"}
+    return {"status": "healthy", "engine": "yolov8-pose-onnx", "build": BUILD_HASH}
 
 
 @app.post("/analyze", response_model=AnalysisResult)
