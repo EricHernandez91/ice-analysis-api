@@ -1038,7 +1038,7 @@ def detect_elements(frame_data, fps):
             print(f"[JUMP] Rejected apex@{apex_frame}: only {rotations} rotations")
             continue
         
-        jump_type = classify_jump(frame_data, start, apex_frame, end, rotations)
+        jump_type, rotations = classify_jump(frame_data, start, apex_frame, end, rotations)
         score = calculate_jump_score(jump_type, rotations)
         
         air_time_s = air_frames / fps
@@ -1175,7 +1175,8 @@ def classify_jump(frame_data, start, apex, end, rotations):
     3. Edge jump differentiation (Salchow vs Loop) — knee bend + leg position
     4. Toe jump differentiation (T vs F vs Lz) — counter-rotation detection
     
-    See SKATING_CLASSIFICATION.md for full research notes.
+    Returns: (jump_name: str, adjusted_rotations: float)
+    The adjusted_rotations may differ from input if non-Axel rounding is applied.
     """
     reasons = []  # Track classification reasoning
     
@@ -1224,27 +1225,32 @@ def classify_jump(frame_data, start, apex, end, rotations):
         if axel_rotations % 1.0 == 0.5:
             reasons.append(f"Axel: half-rot + forward entry → {axel_rotations}")
             print(f"[CLASSIFY] {' | '.join(reasons)}")
-            return f"{rotation_prefix(axel_rotations)} Axel"
+            return f"{rotation_prefix(axel_rotations)} Axel", axel_rotations
     
     # If half-rotation detected but NO forward entry → not an Axel.
     # Round to nearest integer instead (measurement noise caused the .5)
     if is_half_rotation and not forward_entry:
         rotations = round(rotations)
+        if rotations < 1: rotations = 1
         reasons.append(f"Half-rot {fractional:.1f} but backward entry → rounded to {rotations}")
     
     # ── Step 2: Toe Pick Detection ──────────────────────────────
     # Toe pick jumps have one ankle significantly higher than the other
-    # at takeoff (picking foot plants toe in ice behind)
-    takeoff_window = max(3, int((apex - start) * 0.6))
-    takeoff_start = max(start, apex - takeoff_window)
-    takeoff_frames = frame_data[takeoff_start:apex]
+    # at takeoff (picking foot plants toe in ice behind).
+    # The toe pick happens ON THE GROUND before the skater becomes airborne,
+    # so look at frames BEFORE the detected takeoff, not just during flight.
+    takeoff_window = max(5, int((apex - start) * 0.8))
+    # Extend back BEFORE the detected start to capture the ground-level toe pick
+    pre_takeoff_start = max(0, start - 5)  # ~5 frames before detected takeoff
+    takeoff_frames = frame_data[pre_takeoff_start:apex]
     
     ankle_diffs = [fd.get('ankle_diff', 0) for fd in takeoff_frames if fd.get('has_pose')]
     avg_ankle_diff = np.mean(ankle_diffs) if ankle_diffs else 0
     max_ankle_diff = max(ankle_diffs) if ankle_diffs else 0
     
-    TOE_PICK_THRESHOLD = 25  # pixels — ankle height difference indicating toe assist
-    is_toe_jump = avg_ankle_diff > TOE_PICK_THRESHOLD or max_ankle_diff > TOE_PICK_THRESHOLD * 1.5
+    # Lower threshold — 2D camera angle can reduce apparent ankle height diff
+    TOE_PICK_THRESHOLD = 15  # pixels — ankle height difference indicating toe assist
+    is_toe_jump = avg_ankle_diff > TOE_PICK_THRESHOLD or max_ankle_diff > TOE_PICK_THRESHOLD * 2
     
     reasons.append(f"ankle_diff avg={avg_ankle_diff:.1f} max={max_ankle_diff:.1f} → {'toe' if is_toe_jump else 'edge'}")
     
@@ -1271,11 +1277,11 @@ def classify_jump(frame_data, start, apex, end, rotations):
         if avg_knee < LOOP_KNEE_THRESHOLD:
             reasons.append(f"Edge jump: knee_avg={avg_knee:.1f}° < {LOOP_KNEE_THRESHOLD} → Loop")
             print(f"[CLASSIFY] {' | '.join(reasons)}")
-            return f"{prefix} Loop"
+            return f"{prefix} Loop", rotations
         else:
             reasons.append(f"Edge jump: knee_avg={avg_knee:.1f}° ≥ {LOOP_KNEE_THRESHOLD} → Salchow")
             print(f"[CLASSIFY] {' | '.join(reasons)}")
-            return f"{prefix} Salchow"
+            return f"{prefix} Salchow", rotations
     
     # ── Step 4: Toe Jump Classification (Toe Loop vs Flip vs Lutz) ──
     # Key differentiator: Lutz has COUNTER-ROTATION before takeoff
@@ -1315,7 +1321,7 @@ def classify_jump(frame_data, start, apex, end, rotations):
     if counter_rotation:
         reasons.append("Toe + counter-rotation → Lutz")
         print(f"[CLASSIFY] {' | '.join(reasons)}")
-        return f"{prefix} Lutz"
+        return f"{prefix} Lutz", rotations
     
     # Distinguish Flip vs Toe Loop by ankle differential magnitude
     # Flip typically has larger ankle differential (more aggressive toe pick)
@@ -1323,11 +1329,11 @@ def classify_jump(frame_data, start, apex, end, rotations):
     if avg_ankle_diff > FLIP_THRESHOLD:
         reasons.append(f"Toe: ankle_diff={avg_ankle_diff:.1f} > {FLIP_THRESHOLD} → Flip")
         print(f"[CLASSIFY] {' | '.join(reasons)}")
-        return f"{prefix} Flip"
+        return f"{prefix} Flip", rotations
     
     reasons.append(f"Toe: default → Toe Loop")
     print(f"[CLASSIFY] {' | '.join(reasons)}")
-    return f"{prefix} Toe Loop"
+    return f"{prefix} Toe Loop", rotations
 
 
 def classify_spin_position(frame_data, start, end):
