@@ -247,12 +247,15 @@ def extract_frame_data(video_path: str):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if fps > 0 else 0
     
-    # Process enough frames for accurate rotation counting.
-    # Triple axels spin ~1880°/s — need <90° between samples to avoid aliasing.
-    # At 30fps: step=1 → 12°/frame (perfect), step=2 → 24° (good), step=3 → 36° (OK for doubles)
-    # For paid tier, process generously. Target ~40 frames for short clips.
-    target_frames = 40
-    step = max(1, total_frames // target_frames)
+    # Process every frame for short clips (smooth skeleton overlay).
+    # For longer videos, subsample to keep response time reasonable.
+    if duration <= 15:
+        step = 1  # Every frame for clips under 15s
+    elif duration <= 30:
+        step = 2  # Every other frame for 15-30s
+    else:
+        target_frames = 60
+        step = max(1, total_frames // target_frames)
     
     # Also cap video duration — reject videos over 60 seconds
     if duration > 60:
