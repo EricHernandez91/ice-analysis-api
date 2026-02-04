@@ -338,12 +338,18 @@ def extract_frame_data(video_path: str):
             la, ra = skater_kps[KP['left_ankle']], skater_kps[KP['right_ankle']]
             ls, rs = skater_kps[KP['left_shoulder']], skater_kps[KP['right_shoulder']]
             lw, rw = skater_kps[KP['left_wrist']], skater_kps[KP['right_wrist']]
+            nose = skater_kps[KP['nose']]
+            
+            hip_cx = float((lh[0] + rh[0]) / 2)
+            hip_cy = float((lh[1] + rh[1]) / 2)
             
             fd.update({
-                'hip_y': float((lh[1] + rh[1]) / 2),
-                'hip_x': float((lh[0] + rh[0]) / 2),
+                'hip_y': hip_cy,
+                'hip_x': hip_cx,
                 'ankle_y': float(min(la[1], ra[1])),
                 'orientation': float(body_orientation(skater_kps)),
+                'hip_orientation': float(math.degrees(math.atan2(rh[1]-lh[1], rh[0]-lh[0]))),
+                'nose_offset_x': float(nose[0] - hip_cx),
                 'knee_angle_l': float(angle_between(
                     skater_kps[KP['left_hip']][:2],
                     skater_kps[KP['left_knee']][:2],
@@ -395,9 +401,9 @@ def interpolate_frames(sampled_data, total_frames, fps):
             continue
         
         # Interpolate intermediate frames
-        numeric_keys = ['hip_y', 'hip_x', 'ankle_y', 'orientation', 
-                       'knee_angle_l', 'knee_angle_r', 'shoulder_width', 
-                       'wrist_spread', 'ankle_diff']
+        numeric_keys = ['hip_y', 'hip_x', 'ankle_y', 'orientation', 'hip_orientation',
+                       'nose_offset_x', 'knee_angle_l', 'knee_angle_r', 
+                       'shoulder_width', 'wrist_spread', 'ankle_diff']
         
         for step in range(1, gap):
             t = step / gap
@@ -409,8 +415,8 @@ def interpolate_frames(sampled_data, total_frames, fps):
             }
             for key in numeric_keys:
                 if key in cur and key in nxt:
-                    # Handle angle wrapping for orientation
-                    if key == 'orientation':
+                    # Handle angle wrapping for orientation fields
+                    if key in ('orientation', 'hip_orientation'):
                         diff = nxt[key] - cur[key]
                         while diff > 180: diff -= 360
                         while diff < -180: diff += 360
@@ -767,6 +773,140 @@ def generate_detailed_feedback(element_type, metrics):
     return feedback
 
 
+def count_rotation_robust(frame_data, start, end, fps):
+    """Multi-method robust rotation counting for jumps.
+    
+    Problem: Single-method shoulder atan2 tracking undercounts rotation by
+    20-30% due to YOLO keypoint left/right assignment flips during fast
+    rotation. This causes misclassification (Triple Axel → Triple Toe Loop).
+    
+    Solution: Use multiple independent methods and take the maximum.
+    
+    Method A: Median-cleaned shoulder orientation tracking
+      - Replace outlier angular diffs (>2σ from median) with median
+      - Handles L/R keypoint swaps that create sudden ~180° jumps
+    
+    Method B: Directed rotation (dominant direction only)
+      - Sum only CW or CCW diffs (whichever dominates)
+      - Keypoint swaps appear as opposite-direction diffs → filtered out
+    
+    Method C: Hip orientation tracking (same as A but from hip keypoints)
+      - Independent signal from different body landmarks
+    
+    Method D: Shoulder-width oscillation counting
+      - Shoulder width oscillates 2x per rotation (frontal/profile views)
+      - Doesn't depend on left/right labeling at all
+    """
+    # Extend window slightly to capture rotation at takeoff/landing boundaries
+    rot_start = max(0, start - 3)
+    rot_end = min(len(frame_data) - 1, end + 3)
+    
+    # Collect orientation data from real (non-interpolated) frames
+    shoulder_angles = []
+    hip_angles = []
+    shoulder_widths = []
+    
+    for fd in frame_data[rot_start:rot_end + 1]:
+        if fd.get('_real', True) and fd.get('has_pose'):
+            shoulder_angles.append(fd.get('orientation', 0))
+            hip_angles.append(fd.get('hip_orientation', fd.get('orientation', 0)))
+            shoulder_widths.append(fd.get('shoulder_width', 0))
+    
+    # Fallback: use all frames if not enough real ones
+    if len(shoulder_angles) < 3:
+        shoulder_angles = [fd.get('orientation', 0) for fd in frame_data[rot_start:rot_end + 1] if fd.get('has_pose')]
+        hip_angles = [fd.get('hip_orientation', fd.get('orientation', 0)) for fd in frame_data[rot_start:rot_end + 1] if fd.get('has_pose')]
+        shoulder_widths = [fd.get('shoulder_width', 0) for fd in frame_data[rot_start:rot_end + 1] if fd.get('has_pose')]
+    
+    if len(shoulder_angles) < 3:
+        return 0.0, {}
+    
+    def compute_angle_diffs(angles):
+        """Compute wrapped frame-to-frame angular differences."""
+        diffs = []
+        for j in range(1, len(angles)):
+            d = angles[j] - angles[j - 1]
+            while d > 180: d -= 360
+            while d < -180: d += 360
+            diffs.append(d)
+        return diffs
+    
+    def method_cleaned(diffs):
+        """Median-cleaned cumulative rotation. Replaces outlier diffs with median."""
+        if not diffs:
+            return 0.0
+        median_d = float(np.median(diffs))
+        std_d = float(np.std(diffs)) if len(diffs) > 2 else abs(median_d) * 0.5
+        threshold = max(2 * std_d, 40)  # At least 40° deviation to be outlier
+        
+        total = 0.0
+        for d in diffs:
+            if abs(d - median_d) > threshold:
+                # Outlier — likely a keypoint swap. Use median instead.
+                total += abs(median_d)
+            else:
+                total += abs(d)
+        return total / 360
+    
+    def method_directed(diffs):
+        """Directed rotation: only accumulate in dominant direction."""
+        if not diffs:
+            return 0.0
+        total_pos = sum(d for d in diffs if d > 0)
+        total_neg = sum(abs(d) for d in diffs if d < 0)
+        return max(total_pos, total_neg) / 360
+    
+    def method_oscillation(widths):
+        """Count shoulder-width oscillation peaks. 2 zero-crossings per rotation."""
+        if len(widths) < 5:
+            return 0.0
+        sw = np.array(widths, dtype=float)
+        sw_smooth = smooth(sw, window=max(3, len(sw) // 8))
+        sw_centered = sw_smooth - np.mean(sw_smooth)
+        
+        # Count zero crossings
+        crossings = 0
+        for j in range(1, len(sw_centered)):
+            if sw_centered[j] * sw_centered[j - 1] < 0:
+                crossings += 1
+        return crossings / 2.0
+    
+    # ── Compute all methods ──
+    sh_diffs = compute_angle_diffs(shoulder_angles)
+    hp_diffs = compute_angle_diffs(hip_angles)
+    
+    a_shoulder_cleaned = method_cleaned(sh_diffs)
+    b_shoulder_directed = method_directed(sh_diffs)
+    c_hip_cleaned = method_cleaned(hp_diffs)
+    d_hip_directed = method_directed(hp_diffs)
+    e_oscillation = method_oscillation(shoulder_widths)
+    
+    # Also compute the old simple abs-sum for comparison
+    simple_abs = sum(abs(d) for d in sh_diffs) / 360
+    
+    # Take the maximum of all methods (undercounting is the dominant error)
+    raw_rotation = max(a_shoulder_cleaned, b_shoulder_directed, 
+                       c_hip_cleaned, d_hip_directed, e_oscillation)
+    
+    debug = {
+        'simple_abs': round(simple_abs, 2),
+        'shoulder_cleaned': round(a_shoulder_cleaned, 2),
+        'shoulder_directed': round(b_shoulder_directed, 2),
+        'hip_cleaned': round(c_hip_cleaned, 2),
+        'hip_directed': round(d_hip_directed, 2),
+        'oscillation': round(e_oscillation, 2),
+        'chosen_raw': round(raw_rotation, 2),
+        'num_frames': len(shoulder_angles),
+        'median_sh_diff': round(float(np.median(sh_diffs)), 1) if sh_diffs else 0,
+    }
+    
+    print(f"[ROT] simple={simple_abs:.2f} | sh_clean={a_shoulder_cleaned:.2f} sh_dir={b_shoulder_directed:.2f} | "
+          f"hip_clean={c_hip_cleaned:.2f} hip_dir={d_hip_directed:.2f} | osc={e_oscillation:.2f} → raw={raw_rotation:.2f} "
+          f"({len(shoulder_angles)} frames)")
+    
+    return raw_rotation, debug
+
+
 def detect_elements(frame_data, fps):
     """Detect jumps and spins from pose trajectory.
     
@@ -851,35 +991,11 @@ def detect_elements(frame_data, fps):
             print(f"[JUMP] Rejected apex@{apex_frame}: too short ({air_frames} frames)")
             continue
         
-        # Count rotation during the detected jump window only
-        rot_start = start
-        rot_end = end
+        # Count rotation using robust multi-method approach
+        raw_rotations, rot_debug = count_rotation_robust(frame_data, start, end, fps)
         
-        # Use ONLY real (non-interpolated) frames for rotation counting.
-        # Interpolated frames smooth out rapid rotation, undercounting it.
-        real_orientations = []
-        for fd in frame_data[rot_start:rot_end + 1]:
-            if fd.get('_real', True):  # Default True for non-interpolated
-                real_orientations.append(fd.get('orientation', 0))
-        
-        # If we don't have real frame markers, use all frames
-        if len(real_orientations) < 3:
-            real_orientations = [fd.get('orientation', 0) for fd in frame_data[rot_start:rot_end + 1]]
-        
-        total_rotation = 0
-        for j in range(1, len(real_orientations)):
-            diff = real_orientations[j] - real_orientations[j - 1]
-            while diff > 180: diff -= 360
-            while diff < -180: diff += 360
-            total_rotation += abs(diff)
-        
-        raw_rotations = total_rotation / 360
-        
-        # Shoulder-based rotation tracking undercounts by ~15-20% during 
-        # fast rotation (body tucks, keypoints become ambiguous).
-        # Apply calibrated correction. Validated against known jumps:
-        # - Single Axel (1.5): raw ~1.41 → corrected ~1.62 → rounds to 1.5 ✓
-        # - Triple Axel (3.5): raw ~2.94 → corrected ~3.38 → rounds to 3.5 ✓
+        # Apply calibration correction (pose tracking undercounts ~15% due to
+        # keypoint noise during fast rotation, especially at tuck phase)
         corrected = raw_rotations * 1.15
         rotations = round(corrected * 2) / 2
         
@@ -911,7 +1027,8 @@ def detect_elements(frame_data, fps):
                 continue
             feedback.append(tip)
         
-        print(f"[JUMP] ✅ {jump_type}: {rotations} rot (raw: {raw_rotations:.2f}, corrected: {corrected:.2f}), height={height:.0f}px, air={air_time_s:.2f}s, frames {start}-{end}")
+        print(f"[JUMP] ✅ {jump_type}: {rotations} rot (raw: {raw_rotations:.2f}, corrected: {corrected:.2f}), "
+              f"height={height:.0f}px, air={air_time_s:.2f}s, frames {start}-{end}, rot_debug={rot_debug}")
         
         elements.append(SkatingElement(
             type='jump',
